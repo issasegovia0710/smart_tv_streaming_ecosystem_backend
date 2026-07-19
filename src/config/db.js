@@ -1,6 +1,10 @@
 import fs from 'node:fs';
 import mysql from 'mysql2/promise';
-import { env } from './env.js';
+
+import {
+  assertDatabaseEnvironment,
+  env,
+} from './env.js';
 
 export function buildSslOptions() {
   if (!env.dbSsl) return undefined;
@@ -8,15 +12,30 @@ export function buildSslOptions() {
   return {
     minVersion: 'TLSv1.2',
     rejectUnauthorized: true,
-    ...(env.dbCaPath ? { ca: fs.readFileSync(env.dbCaPath, 'utf8') } : {}),
+    ...(env.dbCaPath
+      ? {
+          ca: fs.readFileSync(env.dbCaPath, 'utf8'),
+        }
+      : {}),
   };
 }
 
-export function buildConnectionOptions({ includeDatabase = true } = {}) {
+export function buildConnectionOptions({
+  includeDatabase = true,
+  validate = true,
+} = {}) {
+  if (validate) {
+    assertDatabaseEnvironment();
+  }
+
   return {
-    host: env.dbHost,
+    host: env.dbHost || '127.0.0.1',
     port: env.dbPort,
-    ...(includeDatabase ? { database: env.dbName } : {}),
+    ...(includeDatabase && env.dbName
+      ? {
+          database: env.dbName,
+        }
+      : {}),
     user: env.dbUser,
     password: env.dbPassword,
     ssl: buildSslOptions(),
@@ -28,8 +47,14 @@ export function buildConnectionOptions({ includeDatabase = true } = {}) {
   };
 }
 
+// Crear el pool no abre una conexión inmediatamente.
+// Esto permite que / y /api/v1/health funcionen aunque Vercel todavía
+// no tenga bien configuradas las variables de TiDB.
 export const pool = mysql.createPool({
-  ...buildConnectionOptions(),
+  ...buildConnectionOptions({
+    includeDatabase: true,
+    validate: false,
+  }),
   waitForConnections: true,
   connectionLimit: env.dbPoolLimit,
   maxIdle: env.dbPoolLimit,
@@ -39,12 +64,21 @@ export const pool = mysql.createPool({
 });
 
 export async function assertDatabaseConnection() {
+  assertDatabaseEnvironment();
+
   const connection = await pool.getConnection();
+
   try {
     await connection.ping();
+
     const [[info]] = await connection.query(
-      'SELECT DATABASE() AS databaseName, VERSION() AS databaseVersion',
+      `
+        SELECT
+          DATABASE() AS databaseName,
+          VERSION() AS databaseVersion
+      `,
     );
+
     return info;
   } finally {
     connection.release();
