@@ -298,22 +298,29 @@ export async function testStream(req, res) {
   const text = body.toString('utf8');
   const detectedType = detectType(finalUrl, contentType, text);
   const hls = detectedType === 'hls' ? inspectHls(text, finalUrl) : null;
+  const requestedAsWeb = requestedType === 'web';
 
-  const looksPlayable =
-    response.ok &&
-    detectedType !== 'html' &&
-    detectedType !== 'other' &&
-    (!hls || hls.valid);
+  const looksPlayable = response.ok && (
+    requestedAsWeb
+      ? detectedType === 'html'
+      : detectedType !== 'html' &&
+        detectedType !== 'other' &&
+        (!hls || hls.valid)
+  );
 
-  let message = 'La fuente respondió correctamente.';
+  let message = requestedAsWeb
+    ? 'La página web respondió correctamente.'
+    : 'La fuente respondió correctamente.';
 
   if (!response.ok) {
     message = `La fuente respondió HTTP ${response.status}.`;
-  } else if (detectedType === 'html') {
+  } else if (requestedAsWeb && detectedType !== 'html') {
+    message = 'La URL respondió, pero no parece ser una página web HTML.';
+  } else if (!requestedAsWeb && detectedType === 'html') {
     message = 'La URL devolvió una página HTML, no un stream directo.';
-  } else if (detectedType === 'other') {
+  } else if (!requestedAsWeb && detectedType === 'other') {
     message = 'La respuesta no parece ser HLS, DASH o video MP4.';
-  } else if (hls && !hls.valid) {
+  } else if (!requestedAsWeb && hls && !hls.valid) {
     message = 'La respuesta parece HLS, pero el manifiesto no inicia con #EXTM3U.';
   }
 

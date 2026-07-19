@@ -2,7 +2,7 @@ import { pool } from '../config/db.js';
 import { HttpError } from '../utils/httpError.js';
 import { toSlug } from '../utils/slug.js';
 
-const allowedTypes = new Set(['hls', 'mp4', 'rtmp', 'dash', 'other']);
+const allowedTypes = new Set(['hls', 'mp4', 'rtmp', 'dash', 'web', 'other']);
 
 function nullableDate(value) {
   if (value === null || value === undefined || value === '') return null;
