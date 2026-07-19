@@ -3,10 +3,12 @@ import { assertDatabaseConnection } from './config/db.js';
 import { env } from './config/env.js';
 
 async function start() {
-  await assertDatabaseConnection();
+  const database = await assertDatabaseConnection();
 
   app.listen(env.port, '0.0.0.0', () => {
     console.log(`API lista en http://0.0.0.0:${env.port}`);
+    console.log(`Base conectada: ${database.databaseName} en ${env.dbHost}:${env.dbPort}`);
+    console.log(`Motor: ${database.databaseVersion}`);
   });
 }
 
