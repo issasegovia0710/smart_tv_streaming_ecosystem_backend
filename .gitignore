@@ -10,3 +10,6 @@ backend/uploads/*
 !backend/uploads/.gitkeep
 database/mysql-data/
 .DS_Store
+
+.vercel
+.env*
