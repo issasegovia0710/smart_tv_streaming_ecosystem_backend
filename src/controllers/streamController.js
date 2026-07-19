@@ -146,7 +146,6 @@ export async function listStreams(req, res) {
 }
 
 export async function getStream(req, res) {
-  req.query = { ...req.query };
   const [rows] = await pool.query(
     `
       SELECT

@@ -3,9 +3,9 @@ import net from 'node:net';
 
 import { HttpError } from '../utils/httpError.js';
 
-const MAX_REDIRECTS = 4;
-const MAX_BYTES = 256 * 1024;
-const REQUEST_TIMEOUT_MS = 5000;
+const MAX_REDIRECTS = 3;
+const MAX_BYTES = 96 * 1024;
+const REQUEST_TIMEOUT_MS = 3500;
 
 function isPrivateIpv4(address) {
   const parts = address.split('.').map(Number);
@@ -53,6 +53,7 @@ async function assertPublicTarget(url) {
   }
 
   const hostname = url.hostname.toLowerCase();
+
   if (hostname === 'localhost' || hostname.endsWith('.local')) {
     throw new HttpError(400, 'No se permiten direcciones locales.');
   }
@@ -76,7 +77,7 @@ async function assertPublicTarget(url) {
   }
 }
 
-async function readLimitedBody(response) {
+async function readLimitedBody(response, controller) {
   if (!response.body) return Buffer.alloc(0);
 
   const reader = response.body.getReader();
@@ -93,20 +94,21 @@ async function readLimitedBody(response) {
       chunks.push(chunk);
       total += chunk.length;
 
-      if (value.length > remaining) break;
+      if (value.length >= remaining) break;
     }
   } finally {
+    controller.abort();
     try {
       await reader.cancel();
     } catch {
-      // La respuesta ya terminó o el servidor cerró la conexión.
+      // La respuesta ya terminó.
     }
   }
 
   return Buffer.concat(chunks, total);
 }
 
-async function fetchWithValidatedRedirects(initialUrl) {
+async function fetchLimited(initialUrl) {
   let currentUrl = new URL(initialUrl);
 
   for (let redirectCount = 0; redirectCount <= MAX_REDIRECTS; redirectCount += 1) {
@@ -115,43 +117,59 @@ async function fetchWithValidatedRedirects(initialUrl) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
-    let response;
     try {
-      response = await fetch(currentUrl, {
+      const response = await fetch(currentUrl, {
         method: 'GET',
         redirect: 'manual',
         signal: controller.signal,
         headers: {
-          Accept: 'application/vnd.apple.mpegurl, application/x-mpegURL, application/dash+xml, video/*, */*;q=0.5',
+          Accept:
+            'application/vnd.apple.mpegurl, application/x-mpegURL, application/dash+xml, video/*, */*;q=0.5',
           Range: `bytes=0-${MAX_BYTES - 1}`,
-          'User-Agent': 'Mozilla/5.0 (Smart-TV-Streaming-Admin/1.0)',
+          'User-Agent': 'Mozilla/5.0 (Smart-TV-Streaming-Admin/1.1)',
         },
       });
-    } catch (error) {
-      if (error?.name === 'AbortError') {
-        throw new HttpError(504, 'La fuente tardó demasiado en responder.');
+
+      if (response.status >= 300 && response.status < 400) {
+        clearTimeout(timeout);
+        controller.abort();
+
+        const location = response.headers.get('location');
+        if (!location) {
+          throw new HttpError(502, 'La fuente respondió con una redirección sin destino.');
+        }
+
+        if (redirectCount === MAX_REDIRECTS) {
+          throw new HttpError(502, 'La fuente excedió el límite de redirecciones.');
+        }
+
+        currentUrl = new URL(location, currentUrl);
+        continue;
       }
-      throw new HttpError(502, `No fue posible conectar con la fuente: ${error.message}`);
-    } finally {
+
+      const body = await readLimitedBody(response, controller);
       clearTimeout(timeout);
-    }
 
-    if (response.status >= 300 && response.status < 400) {
-      const location = response.headers.get('location');
-      if (!location) {
-        throw new HttpError(502, 'La fuente respondió con una redirección sin destino.');
+      return {
+        response,
+        body,
+        finalUrl: currentUrl.toString(),
+      };
+    } catch (error) {
+      clearTimeout(timeout);
+      controller.abort();
+
+      if (error?.name === 'AbortError') {
+        throw new HttpError(408, 'La fuente tardó demasiado en responder.');
       }
 
-      if (redirectCount === MAX_REDIRECTS) {
-        throw new HttpError(502, 'La fuente excedió el límite de redirecciones.');
-      }
+      if (error instanceof HttpError) throw error;
 
-      currentUrl = new URL(location, currentUrl);
-      continue;
+      throw new HttpError(
+        502,
+        `No fue posible conectar con la fuente: ${error.message}`,
+      );
     }
-
-    const body = await readLimitedBody(response);
-    return { response, body, finalUrl: currentUrl.toString() };
   }
 
   throw new HttpError(502, 'No fue posible completar la prueba.');
@@ -160,12 +178,14 @@ async function fetchWithValidatedRedirects(initialUrl) {
 function detectType(url, contentType, text) {
   const normalizedUrl = url.toLowerCase();
   const normalizedType = contentType.toLowerCase();
+  const trimmed = text.trimStart();
 
-  if (text.trimStart().startsWith('#EXTM3U')) return 'hls';
+  if (trimmed.startsWith('#EXTM3U')) return 'hls';
   if (normalizedType.includes('mpegurl') || normalizedUrl.includes('.m3u8')) return 'hls';
   if (normalizedType.includes('dash+xml') || normalizedUrl.includes('.mpd')) return 'dash';
   if (normalizedType.startsWith('video/') || normalizedUrl.includes('.mp4')) return 'mp4';
-  if (normalizedType.includes('html')) return 'html';
+  if (normalizedType.includes('html') || /^<!doctype html|^<html/i.test(trimmed)) return 'html';
+
   return 'other';
 }
 
@@ -191,9 +211,7 @@ function inspectHls(text, baseUrl) {
 
     if (line.startsWith('#EXT-X-STREAM-INF:')) {
       const nextUri = lines.slice(index + 1).find((candidate) => !candidate.startsWith('#'));
-      if (nextUri) {
-        variants.push(resolveReferencedUrl(baseUrl, nextUri));
-      }
+      if (nextUri) variants.push(resolveReferencedUrl(baseUrl, nextUri));
       continue;
     }
 
@@ -211,28 +229,21 @@ function inspectHls(text, baseUrl) {
   };
 }
 
-async function probeChildResource(url) {
-  if (!url) return null;
-
-  try {
-    const { response, body, finalUrl } = await fetchWithValidatedRedirects(url);
-    const contentType = response.headers.get('content-type') || '';
-    const text = body.toString('utf8');
-
-    return {
-      ok: response.ok,
-      status: response.status,
-      finalUrl,
-      contentType,
-      detectedType: detectType(finalUrl, contentType, text),
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      status: error.statusCode || 502,
-      message: error.message,
-    };
-  }
+function diagnosticFailure(error, requestedType) {
+  return {
+    reachable: false,
+    looksPlayable: false,
+    requestedType: requestedType || null,
+    detectedType: null,
+    status: error.statusCode || null,
+    finalUrl: null,
+    contentType: null,
+    contentLength: null,
+    bytesInspected: 0,
+    hls: null,
+    child: null,
+    message: error.message || 'No fue posible comprobar la fuente.',
+  };
 }
 
 export async function testStream(req, res) {
@@ -248,9 +259,18 @@ export async function testStream(req, res) {
       ok: true,
       data: {
         reachable: false,
+        looksPlayable: false,
         requestedType: requestedType || 'rtmp',
         detectedType: 'rtmp',
-        message: 'RTMP no puede previsualizarse directamente en el navegador o en la mayoría de TVs. Usa una salida HLS o DASH.',
+        status: null,
+        finalUrl: rawUrl,
+        contentType: null,
+        contentLength: null,
+        bytesInspected: 0,
+        hls: null,
+        child: null,
+        message:
+          'RTMP no se reproduce directamente en el navegador. Usa una salida HLS o DASH.',
       },
     });
   }
@@ -262,22 +282,31 @@ export async function testStream(req, res) {
     throw new HttpError(400, 'La URL no tiene un formato válido.');
   }
 
-  const { response, body, finalUrl } = await fetchWithValidatedRedirects(parsedUrl);
+  let fetched;
+  try {
+    fetched = await fetchLimited(parsedUrl);
+  } catch (error) {
+    return res.json({
+      ok: true,
+      data: diagnosticFailure(error, requestedType),
+    });
+  }
+
+  const { response, body, finalUrl } = fetched;
   const contentType = response.headers.get('content-type') || '';
   const contentLength = response.headers.get('content-length');
   const text = body.toString('utf8');
   const detectedType = detectType(finalUrl, contentType, text);
   const hls = detectedType === 'hls' ? inspectHls(text, finalUrl) : null;
-  const child = hls?.sampleUrl ? await probeChildResource(hls.sampleUrl) : null;
 
   const looksPlayable =
     response.ok &&
     detectedType !== 'html' &&
     detectedType !== 'other' &&
-    (!hls || hls.valid) &&
-    (!child || child.ok);
+    (!hls || hls.valid);
 
   let message = 'La fuente respondió correctamente.';
+
   if (!response.ok) {
     message = `La fuente respondió HTTP ${response.status}.`;
   } else if (detectedType === 'html') {
@@ -286,11 +315,9 @@ export async function testStream(req, res) {
     message = 'La respuesta no parece ser HLS, DASH o video MP4.';
   } else if (hls && !hls.valid) {
     message = 'La respuesta parece HLS, pero el manifiesto no inicia con #EXTM3U.';
-  } else if (child && !child.ok) {
-    message = 'El manifiesto cargó, pero su primera variante o segmento no respondió correctamente.';
   }
 
-  res.json({
+  return res.json({
     ok: true,
     data: {
       reachable: response.ok,
@@ -303,7 +330,7 @@ export async function testStream(req, res) {
       contentLength: contentLength ? Number(contentLength) : null,
       bytesInspected: body.length,
       hls,
-      child,
+      child: null,
       message,
     },
   });
