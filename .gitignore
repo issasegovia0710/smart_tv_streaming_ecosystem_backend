@@ -1,0 +1,12 @@
+.env
+**/.env
+**/node_modules/
+**/dist/
+**/build/
+**/.dart_tool/
+**/.packages
+**/pubspec.lock
+backend/uploads/*
+!backend/uploads/.gitkeep
+database/mysql-data/
+.DS_Store
