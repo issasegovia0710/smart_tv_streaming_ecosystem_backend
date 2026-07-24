@@ -32,44 +32,36 @@ app.use(
   }),
 );
 
-const allowedOrigins = env.corsOrigin
-  .split(',')
-  .map((item) => item.trim().replace(/\/+$/, ''))
-  .filter(Boolean);
+const corsOptions = {
+  origin: '*',
 
-app.use(
-  cors({
-    origin(origin, callback) {
-      // Aplicaciones de TV, Postman y peticiones servidor-servidor
-      // pueden llegar sin encabezado Origin.
-      if (!origin || origin === 'null') {
-        return callback(null, true);
-      }
+  methods: [
+    'GET',
+    'HEAD',
+    'POST',
+    'PUT',
+    'PATCH',
+    'DELETE',
+    'OPTIONS',
+  ],
 
-      const normalizedOrigin = origin.replace(/\/+$/, '');
+  allowedHeaders: [
+    'Content-Type',
+    'Authorization',
+    'Range',
+  ],
 
-      if (
-        env.corsOrigin === '*' ||
-        allowedOrigins.includes(normalizedOrigin)
-      ) {
-        return callback(null, true);
-      }
+  exposedHeaders: [
+    'Content-Length',
+    'Content-Range',
+    'Accept-Ranges',
+  ],
 
-      return callback(
-        new Error(`Origen no permitido por CORS: ${origin}`),
-      );
-    },
-    methods: [
-      'GET',
-      'POST',
-      'PUT',
-      'PATCH',
-      'DELETE',
-      'OPTIONS',
-    ],
-    allowedHeaders: ['Content-Type', 'Authorization'],
-  }),
-);
+  // Algunas Smart TV antiguas tienen problemas con respuestas OPTIONS 204.
+  optionsSuccessStatus: 200,
+};
+
+app.use(cors(corsOptions));
 
 app.use(morgan('combined'));
 app.use(express.json({ limit: '1mb' }));
