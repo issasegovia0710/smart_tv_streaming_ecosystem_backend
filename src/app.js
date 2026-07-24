@@ -11,7 +11,7 @@ import { assertDatabaseConnection } from './config/db.js';
 import { categoryRouter } from './routes/categoryRoutes.js';
 import { streamRouter } from './routes/streamRoutes.js';
 import { uploadRouter } from './routes/uploadRoutes.js';
-import { webPageRouter } from './routes/webPageRoutes.js';
+import { tvRouter } from './routes/tvRoutes.js';
 
 import { getCatalog } from './controllers/catalogController.js';
 import { asyncHandler } from './utils/asyncHandler.js';
@@ -32,36 +32,44 @@ app.use(
   }),
 );
 
-const corsOptions = {
-  origin: '*',
+const allowedOrigins = env.corsOrigin
+  .split(',')
+  .map((item) => item.trim().replace(/\/+$/, ''))
+  .filter(Boolean);
 
-  methods: [
-    'GET',
-    'HEAD',
-    'POST',
-    'PUT',
-    'PATCH',
-    'DELETE',
-    'OPTIONS',
-  ],
+app.use(
+  cors({
+    origin(origin, callback) {
+      // Aplicaciones de TV, Postman y peticiones servidor-servidor
+      // pueden llegar sin encabezado Origin.
+      if (!origin) {
+        return callback(null, true);
+      }
 
-  allowedHeaders: [
-    'Content-Type',
-    'Authorization',
-    'Range',
-  ],
+      const normalizedOrigin = origin.replace(/\/+$/, '');
 
-  exposedHeaders: [
-    'Content-Length',
-    'Content-Range',
-    'Accept-Ranges',
-  ],
+      if (
+        env.corsOrigin === '*' ||
+        allowedOrigins.includes(normalizedOrigin)
+      ) {
+        return callback(null, true);
+      }
 
-  // Algunas Smart TV antiguas tienen problemas con respuestas OPTIONS 204.
-  optionsSuccessStatus: 200,
-};
-
-app.use(cors(corsOptions));
+      return callback(
+        new Error(`Origen no permitido por CORS: ${origin}`),
+      );
+    },
+    methods: [
+      'GET',
+      'POST',
+      'PUT',
+      'PATCH',
+      'DELETE',
+      'OPTIONS',
+    ],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+  }),
+);
 
 app.use(morgan('combined'));
 app.use(express.json({ limit: '1mb' }));
@@ -92,7 +100,7 @@ app.get('/', (req, res) => {
       catalog: '/api/v1/catalog',
       categories: '/api/v1/categories',
       streams: '/api/v1/streams',
-      webPageViewer: '/api/v1/web-pages/render?url=https://example.com',
+      tvBootstrap: '/api/v1/tv/bootstrap',
     },
   });
 });
@@ -134,7 +142,7 @@ app.get(
 app.use('/api/v1/categories', categoryRouter);
 app.use('/api/v1/streams', streamRouter);
 app.use('/api/v1/uploads', uploadRouter);
-app.use('/api/v1/web-pages', webPageRouter);
+app.use('/api/v1/tv', tvRouter);
 
 app.use(notFoundHandler);
 app.use(errorHandler);

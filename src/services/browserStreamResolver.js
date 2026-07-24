@@ -301,8 +301,8 @@ function cacheSet(url, value) {
   resolutionCache.set(url, { value, createdAt: Date.now() });
 }
 
-export async function resolveStreamWithBrowser(rawUrl) {
-  const cached = cacheGet(rawUrl);
+export async function resolveStreamWithBrowser(rawUrl, options = {}) {
+  const cached = options.forceRefresh ? null : cacheGet(rawUrl);
   if (cached) return cached;
 
   const startedAt = Date.now();
@@ -553,6 +553,37 @@ export async function resolveStreamWithBrowser(rawUrl) {
           push(element.getAttribute('data-url'));
           push(element.getAttribute('data-file'));
         });
+
+        // Contrato recomendado para páginas PHP/HTML administradas por el usuario.
+        document.querySelectorAll(
+          'meta[name="tv-stream-url"], meta[property="og:video"], ' +
+          'meta[property="og:video:url"], link[rel="alternate"]'
+        ).forEach((element) => {
+          push(element.getAttribute('content'));
+          push(element.getAttribute('href'));
+        });
+
+        document.querySelectorAll('script[type="application/ld+json"]').forEach((element) => {
+          try {
+            const data = JSON.parse(element.textContent || '{}');
+            const queue = Array.isArray(data) ? data.slice() : [data];
+            while (queue.length) {
+              const current = queue.shift();
+              if (!current || typeof current !== 'object') continue;
+              push(current.contentUrl);
+              push(current.embedUrl);
+              Object.keys(current).forEach((key) => {
+                const value = current[key];
+                if (value && typeof value === 'object') queue.push(value);
+              });
+            }
+          } catch (_) {}
+        });
+
+        try {
+          push(window.TV_STREAM_URL);
+          push(window.__TV_STREAM_URL__);
+        } catch (_) {}
 
         document.querySelectorAll('video').forEach((video) => {
           try {

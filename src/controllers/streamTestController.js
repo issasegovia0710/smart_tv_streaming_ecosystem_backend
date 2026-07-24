@@ -328,7 +328,7 @@ function extractCandidates(html, baseUrl) {
   };
 }
 
-async function resolveWebMedia(rawUrl) {
+export async function resolveWebMedia(rawUrl, options = {}) {
   let startUrl;
   try {
     startUrl = new URL(rawUrl);
@@ -406,7 +406,7 @@ async function resolveWebMedia(rawUrl) {
     }
   }
 
-  const browserResolution = await resolveStreamWithBrowser(startUrl.toString());
+  const browserResolution = await resolveStreamWithBrowser(startUrl.toString(), options);
 
   if (browserResolution.resolved) {
     return {
@@ -461,7 +461,9 @@ export async function resolveStream(req, res) {
   const rawUrl = String(req.body?.url || '').trim();
   if (!rawUrl) throw new HttpError(400, 'La URL es obligatoria.');
 
-  const resolution = await resolveWebMedia(rawUrl);
+  const resolution = await resolveWebMedia(rawUrl, {
+    forceRefresh: req.body?.forceRefresh === true,
+  });
   return res.json({ ok: true, data: resolution });
 }
 
@@ -504,7 +506,9 @@ export async function testStream(req, res) {
   }
 
   if (requestedType === 'web') {
-    const resolution = await resolveWebMedia(rawUrl);
+    const resolution = await resolveWebMedia(rawUrl, {
+      forceRefresh: req.body?.forceRefresh === true,
+    });
 
     return res.json({
       ok: true,
