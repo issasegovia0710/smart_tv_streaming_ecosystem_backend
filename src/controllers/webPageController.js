@@ -349,7 +349,9 @@ function buildBridgeScript({ proxyEndpoint, mode }) {
       'color:#fff!important',
       'font:700 18px Arial,sans-serif!important'
     ].join(';'));
-    button.onclick = function () { window.location.reload(); };
+    button.onclick = function () {
+      try { window.parent.postMessage({ type: 'tvstream-close' }, '*'); } catch (_) {}
+    };
 
     toolbar.appendChild(label);
     toolbar.appendChild(button);
@@ -407,7 +409,7 @@ function buildBridgeScript({ proxyEndpoint, mode }) {
     if (MODE === 'tv' && (code === 10009 || code === 27 || event.key === 'Escape')) {
       event.preventDefault();
       event.stopPropagation();
-      window.location.reload();
+      try { window.parent.postMessage({ type: 'tvstream-close' }, '*'); } catch (_) {}
     }
   }, true);
 })();
@@ -417,9 +419,10 @@ function buildBridgeScript({ proxyEndpoint, mode }) {
 function injectIntoHtml(html, finalUrl, bridgeScript) {
   let output = html
     .replace(/<meta\b[^>]*http-equiv\s*=\s*["']?content-security-policy["']?[^>]*>/gi, '')
-    .replace(/<base\b[^>]*>/gi, '');
+    .replace(/<base\b[^>]*>/gi, '')
+    .replace(/<meta\b[^>]*http-equiv\s*=\s*["']?refresh["']?[^>]*>/gi, '');
 
-  const injection = `<base href="${escapeHtmlAttribute(finalUrl)}">${bridgeScript}`;
+  const injection = `<base href="${escapeHtmlAttribute(finalUrl)}" target="_self">${bridgeScript}`;
 
   if (/<head\b[^>]*>/i.test(output)) {
     return output.replace(/<head\b[^>]*>/i, (match) => `${match}${injection}`);
@@ -458,9 +461,14 @@ export async function renderWebPage(req, res) {
   res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
   res.setHeader('Cache-Control', 'no-store, max-age=0');
   res.setHeader('Referrer-Policy', 'no-referrer-when-downgrade');
+  const sandboxPolicy = mode === 'tv'
+    ? 'sandbox allow-scripts allow-forms allow-same-origin allow-presentation allow-modals; '
+    : '';
+
   res.setHeader(
     'Content-Security-Policy',
-    "default-src * data: blob: 'unsafe-inline' 'unsafe-eval'; connect-src * data: blob:; img-src * data: blob:; media-src * data: blob:; frame-src * data: blob:; child-src * data: blob:; style-src * 'unsafe-inline'; script-src * 'unsafe-inline' 'unsafe-eval'; frame-ancestors *;",
+    sandboxPolicy +
+      "default-src * data: blob: 'unsafe-inline' 'unsafe-eval'; connect-src * data: blob:; img-src * data: blob:; media-src * data: blob:; frame-src * data: blob:; child-src * data: blob:; style-src * 'unsafe-inline'; script-src * 'unsafe-inline' 'unsafe-eval'; frame-ancestors *;",
   );
   res.type('html').send(renderedHtml);
 }
