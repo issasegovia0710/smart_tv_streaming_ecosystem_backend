@@ -10,8 +10,39 @@ const MAX_BODY_BYTES = 1024 * 1024;
 const DEFAULT_USER_AGENT =
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 ' +
   '(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36';
-const DEFAULT_CHROMIUM_PACK_URL =
-  'https://github.com/Sparticuz/chromium/releases/download/v143.0.4/chromium-v143.0.4-pack.tar';
+const CHROMIUM_RELEASE_TAG = 'v143.0.4';
+
+function chromiumArchitecture() {
+  return process.arch === 'arm64' ? 'arm64' : 'x64';
+}
+
+function defaultChromiumPackUrl() {
+  const arch = chromiumArchitecture();
+  return (
+    `https://github.com/Sparticuz/chromium/releases/download/${CHROMIUM_RELEASE_TAG}/` +
+    `chromium-${CHROMIUM_RELEASE_TAG}-pack.${arch}.tar`
+  );
+}
+
+function normalizeChromiumPackUrl(value) {
+  const configured = String(value || '').trim();
+  if (!configured) return defaultChromiumPackUrl();
+
+  try {
+    const parsed = new URL(configured);
+    const arch = chromiumArchitecture();
+
+    // Corrige automáticamente la URL antigua que terminaba en "-pack.tar".
+    // Los releases reales publican "-pack.x64.tar" y "-pack.arm64.tar".
+    if (/chromium-v[^/]+-pack\.tar$/i.test(parsed.pathname)) {
+      parsed.pathname = parsed.pathname.replace(/-pack\.tar$/i, `-pack.${arch}.tar`);
+    }
+
+    return parsed.toString();
+  } catch {
+    return defaultChromiumPackUrl();
+  }
+}
 
 const resolutionCache = new Map();
 
@@ -199,8 +230,28 @@ async function launchBrowser() {
   if (!executablePath) {
     const chromiumModule = await import('@sparticuz/chromium-min');
     const serverlessChromium = chromiumModule.default;
-    const packUrl = String(process.env.CHROMIUM_PACK_URL || DEFAULT_CHROMIUM_PACK_URL).trim();
-    executablePath = await serverlessChromium.executablePath(packUrl);
+    const configuredPackUrl = normalizeChromiumPackUrl(process.env.CHROMIUM_PACK_URL);
+    const fallbackPackUrl = defaultChromiumPackUrl();
+
+    try {
+      executablePath = await serverlessChromium.executablePath(configuredPackUrl);
+    } catch (firstError) {
+      if (configuredPackUrl === fallbackPackUrl) {
+        throw new Error(
+          `No se pudo descargar Chromium desde ${configuredPackUrl}: ${firstError.message}`,
+        );
+      }
+
+      try {
+        executablePath = await serverlessChromium.executablePath(fallbackPackUrl);
+      } catch (fallbackError) {
+        throw new Error(
+          `No se pudo descargar Chromium. URL configurada: ${configuredPackUrl}. ` +
+          `URL alternativa: ${fallbackPackUrl}. Error: ${fallbackError.message}`,
+        );
+      }
+    }
+
     args = [...serverlessChromium.args, '--autoplay-policy=no-user-gesture-required'];
   }
 
