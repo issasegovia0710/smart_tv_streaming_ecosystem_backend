@@ -3,9 +3,11 @@ import net from 'node:net';
 
 import { HttpError } from '../utils/httpError.js';
 
-const MAX_REDIRECTS = 3;
-const MAX_BYTES = 96 * 1024;
-const REQUEST_TIMEOUT_MS = 3500;
+const MAX_REDIRECTS = 4;
+const MAX_BYTES = 256 * 1024;
+const REQUEST_TIMEOUT_MS = 6500;
+const RESOLVE_MAX_DEPTH = 3;
+const RESOLVE_MAX_REQUESTS = 12;
 
 function isPrivateIpv4(address) {
   const parts = address.split('.').map(Number);
@@ -49,7 +51,7 @@ function isPrivateAddress(address) {
 
 async function assertPublicTarget(url) {
   if (!['http:', 'https:'].includes(url.protocol)) {
-    throw new HttpError(400, 'La prueba solo acepta URLs HTTP o HTTPS.');
+    throw new HttpError(400, 'Solo se aceptan URLs HTTP o HTTPS.');
   }
 
   const hostname = url.hostname.toLowerCase();
@@ -69,7 +71,7 @@ async function assertPublicTarget(url) {
   try {
     addresses = await dns.lookup(hostname, { all: true, verbatim: true });
   } catch {
-    throw new HttpError(400, 'No fue posible resolver el dominio del stream.');
+    throw new HttpError(400, 'No fue posible resolver el dominio.');
   }
 
   if (!addresses.length || addresses.some(({ address }) => isPrivateAddress(address))) {
@@ -108,8 +110,9 @@ async function readLimitedBody(response, controller) {
   return Buffer.concat(chunks, total);
 }
 
-async function fetchLimited(initialUrl) {
+async function fetchLimited(initialUrl, options = {}) {
   let currentUrl = new URL(initialUrl);
+  let currentReferer = options.referer || '';
 
   for (let redirectCount = 0; redirectCount <= MAX_REDIRECTS; redirectCount += 1) {
     await assertPublicTarget(currentUrl);
@@ -118,16 +121,22 @@ async function fetchLimited(initialUrl) {
     const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
     try {
+      const headers = {
+        Accept:
+          options.accept ||
+          'text/html,application/xhtml+xml,application/vnd.apple.mpegurl,application/x-mpegURL,application/dash+xml,video/*,*/*;q=0.5',
+        Range: `bytes=0-${MAX_BYTES - 1}`,
+        'User-Agent':
+          'Mozilla/5.0 (SMART-TV; LINUX; Tizen 5.5) AppleWebKit/538.1 SamsungBrowser/2.1 TV Safari/538.1',
+      };
+
+      if (currentReferer) headers.Referer = currentReferer;
+
       const response = await fetch(currentUrl, {
         method: 'GET',
         redirect: 'manual',
         signal: controller.signal,
-        headers: {
-          Accept:
-            'application/vnd.apple.mpegurl, application/x-mpegURL, application/dash+xml, video/*, */*;q=0.5',
-          Range: `bytes=0-${MAX_BYTES - 1}`,
-          'User-Agent': 'Mozilla/5.0 (Smart-TV-Streaming-Admin/1.1)',
-        },
+        headers,
       });
 
       if (response.status >= 300 && response.status < 400) {
@@ -143,6 +152,7 @@ async function fetchLimited(initialUrl) {
           throw new HttpError(502, 'La fuente excedió el límite de redirecciones.');
         }
 
+        currentReferer = currentUrl.toString();
         currentUrl = new URL(location, currentUrl);
         continue;
       }
@@ -172,7 +182,7 @@ async function fetchLimited(initialUrl) {
     }
   }
 
-  throw new HttpError(502, 'No fue posible completar la prueba.');
+  throw new HttpError(502, 'No fue posible completar la solicitud.');
 }
 
 function detectType(url, contentType, text) {
@@ -191,7 +201,17 @@ function detectType(url, contentType, text) {
 
 function resolveReferencedUrl(baseUrl, value) {
   try {
-    return new URL(value, baseUrl).toString();
+    const cleaned = String(value || '')
+      .trim()
+      .replace(/&amp;/gi, '&')
+      .replace(/\\u002f/gi, '/')
+      .replace(/\\\//g, '/');
+
+    if (!cleaned || cleaned.startsWith('javascript:') || cleaned.startsWith('data:')) {
+      return null;
+    }
+
+    return new URL(cleaned, baseUrl).toString();
   } catch {
     return null;
   }
@@ -229,6 +249,168 @@ function inspectHls(text, baseUrl) {
   };
 }
 
+function decodePossibleBase64(value) {
+  const compact = String(value || '').replace(/\s+/g, '');
+  if (compact.length < 40 || compact.length > 8192 || !/^[A-Za-z0-9+/=_-]+$/.test(compact)) {
+    return '';
+  }
+
+  try {
+    const normalized = compact.replace(/-/g, '+').replace(/_/g, '/');
+    return Buffer.from(normalized, 'base64').toString('utf8');
+  } catch {
+    return '';
+  }
+}
+
+function isMediaUrl(url) {
+  const normalized = String(url || '').toLowerCase();
+  return (
+    normalized.includes('.m3u8') ||
+    normalized.includes('.mpd') ||
+    normalized.includes('.mp4') ||
+    normalized.includes('format=m3u8') ||
+    normalized.includes('type=m3u8')
+  );
+}
+
+function extractCandidates(html, baseUrl) {
+  const normalizedHtml = String(html || '')
+    .replace(/\\u002f/gi, '/')
+    .replace(/\\\//g, '/')
+    .replace(/&amp;/gi, '&');
+
+  const rawValues = [];
+  const addMatches = (regex, group = 1) => {
+    let match;
+    while ((match = regex.exec(normalizedHtml)) !== null) {
+      if (match[group]) rawValues.push(match[group]);
+      if (rawValues.length > 300) break;
+    }
+  };
+
+  addMatches(/(?:src|href|file|source|playlist|hls|url|data-src|data-url)\s*[:=]\s*["']([^"']+)["']/gi);
+  addMatches(/["'](?:src|file|source|playlist|hls|url)["']\s*:\s*["']([^"']+)["']/gi);
+  addMatches(/(https?:\/\/[^\s"'<>\\]+)/gi);
+  addMatches(/(\/\/[^\s"'<>\\]+)/gi);
+  addMatches(/([A-Za-z0-9_./?=&%-]+\.(?:m3u8|mpd|mp4)(?:\?[^\s"'<>\\]*)?)/gi);
+
+  const encodedMatches = normalizedHtml.match(/[A-Za-z0-9+/=_-]{40,}/g) || [];
+  for (const encoded of encodedMatches.slice(0, 30)) {
+    const decoded = decodePossibleBase64(encoded);
+    if (!decoded) continue;
+
+    const urls = decoded.match(/https?:\/\/[^\s"'<>]+/gi) || [];
+    rawValues.push(...urls);
+  }
+
+  const media = [];
+  const pages = [];
+  const seen = new Set();
+
+  for (const rawValue of rawValues) {
+    const resolved = resolveReferencedUrl(baseUrl, rawValue);
+    if (!resolved || seen.has(resolved)) continue;
+    seen.add(resolved);
+
+    if (isMediaUrl(resolved)) {
+      media.push(resolved);
+      continue;
+    }
+
+    if (/^https?:\/\//i.test(resolved)) pages.push(resolved);
+  }
+
+  return {
+    media: media.slice(0, 40),
+    pages: pages.slice(0, 40),
+  };
+}
+
+async function resolveWebMedia(rawUrl) {
+  let startUrl;
+  try {
+    startUrl = new URL(rawUrl);
+  } catch {
+    throw new HttpError(400, 'La URL no tiene un formato válido.');
+  }
+
+  const queue = [{ url: startUrl.toString(), depth: 0, referer: '' }];
+  const visited = new Set();
+  let requests = 0;
+  let lastReachablePage = null;
+
+  while (queue.length && requests < RESOLVE_MAX_REQUESTS) {
+    const current = queue.shift();
+    if (!current || visited.has(current.url)) continue;
+    visited.add(current.url);
+    requests += 1;
+
+    let fetched;
+    try {
+      fetched = await fetchLimited(current.url, { referer: current.referer });
+    } catch {
+      continue;
+    }
+
+    const contentType = fetched.response.headers.get('content-type') || '';
+    const text = fetched.body.toString('utf8');
+    const detectedType = detectType(fetched.finalUrl, contentType, text);
+
+    if (fetched.response.ok && ['hls', 'dash', 'mp4'].includes(detectedType)) {
+      const hls = detectedType === 'hls' ? inspectHls(text, fetched.finalUrl) : null;
+      if (!hls || hls.valid || fetched.finalUrl.toLowerCase().includes('.m3u8')) {
+        return {
+          resolved: true,
+          playbackUrl: fetched.finalUrl,
+          resolvedType: detectedType,
+          sourcePageUrl: startUrl.toString(),
+          resolvedFrom: current.referer || startUrl.toString(),
+          requests,
+          message: `Flujo ${detectedType.toUpperCase()} encontrado.`,
+        };
+      }
+    }
+
+    if (!fetched.response.ok || detectedType !== 'html') continue;
+
+    lastReachablePage = fetched.finalUrl;
+    if (current.depth >= RESOLVE_MAX_DEPTH) continue;
+
+    const candidates = extractCandidates(text, fetched.finalUrl);
+    const nextDepth = current.depth + 1;
+
+    for (let index = candidates.media.length - 1; index >= 0; index -= 1) {
+      queue.unshift({
+        url: candidates.media[index],
+        depth: nextDepth,
+        referer: fetched.finalUrl,
+      });
+    }
+
+    for (const pageUrl of candidates.pages) {
+      if (!visited.has(pageUrl)) {
+        queue.push({
+          url: pageUrl,
+          depth: nextDepth,
+          referer: fetched.finalUrl,
+        });
+      }
+    }
+  }
+
+  return {
+    resolved: false,
+    playbackUrl: null,
+    resolvedType: null,
+    sourcePageUrl: startUrl.toString(),
+    resolvedFrom: lastReachablePage,
+    requests,
+    message:
+      'La página respondió, pero no se encontró una URL directa HLS, DASH o MP4. La app no abrirá el navegador.',
+  };
+}
+
 function diagnosticFailure(error, requestedType) {
   return {
     reachable: false,
@@ -242,8 +424,18 @@ function diagnosticFailure(error, requestedType) {
     bytesInspected: 0,
     hls: null,
     child: null,
+    resolvedPlaybackUrl: null,
+    resolvedType: null,
     message: error.message || 'No fue posible comprobar la fuente.',
   };
+}
+
+export async function resolveStream(req, res) {
+  const rawUrl = String(req.body?.url || '').trim();
+  if (!rawUrl) throw new HttpError(400, 'La URL es obligatoria.');
+
+  const resolution = await resolveWebMedia(rawUrl);
+  return res.json({ ok: true, data: resolution });
 }
 
 export async function testStream(req, res) {
@@ -269,8 +461,10 @@ export async function testStream(req, res) {
         bytesInspected: 0,
         hls: null,
         child: null,
+        resolvedPlaybackUrl: null,
+        resolvedType: null,
         message:
-          'RTMP no se reproduce directamente en el navegador. Usa una salida HLS o DASH.',
+          'RTMP no se reproduce directamente. Usa una salida HLS o DASH.',
       },
     });
   }
@@ -300,22 +494,31 @@ export async function testStream(req, res) {
   const hls = detectedType === 'hls' ? inspectHls(text, finalUrl) : null;
   const requestedAsWeb = requestedType === 'web';
 
+  let resolution = {
+    resolved: false,
+    playbackUrl: null,
+    resolvedType: null,
+    message: '',
+  };
+
+  if (requestedAsWeb && response.ok) {
+    resolution = await resolveWebMedia(rawUrl);
+  }
+
   const looksPlayable = response.ok && (
     requestedAsWeb
-      ? detectedType === 'html'
+      ? resolution.resolved
       : detectedType !== 'html' &&
         detectedType !== 'other' &&
         (!hls || hls.valid)
   );
 
   let message = requestedAsWeb
-    ? 'La página web respondió correctamente.'
+    ? resolution.message
     : 'La fuente respondió correctamente.';
 
   if (!response.ok) {
     message = `La fuente respondió HTTP ${response.status}.`;
-  } else if (requestedAsWeb && detectedType !== 'html') {
-    message = 'La URL respondió, pero no parece ser una página web HTML.';
   } else if (!requestedAsWeb && detectedType === 'html') {
     message = 'La URL devolvió una página HTML, no un stream directo.';
   } else if (!requestedAsWeb && detectedType === 'other') {
@@ -338,6 +541,9 @@ export async function testStream(req, res) {
       bytesInspected: body.length,
       hls,
       child: null,
+      resolvedPlaybackUrl: resolution.playbackUrl,
+      resolvedType: resolution.resolvedType,
+      resolverRequests: resolution.requests || 0,
       message,
     },
   });
