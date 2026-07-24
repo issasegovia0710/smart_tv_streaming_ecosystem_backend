@@ -12,6 +12,7 @@ import { categoryRouter } from './routes/categoryRoutes.js';
 import { streamRouter } from './routes/streamRoutes.js';
 import { uploadRouter } from './routes/uploadRoutes.js';
 import { tvRouter } from './routes/tvRoutes.js';
+import { mediaRouter } from './routes/mediaRoutes.js';
 
 import { getCatalog } from './controllers/catalogController.js';
 import { asyncHandler } from './utils/asyncHandler.js';
@@ -67,7 +68,9 @@ app.use(
       'DELETE',
       'OPTIONS',
     ],
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'Range'],
+    exposedHeaders: ['Content-Length', 'Content-Range', 'Accept-Ranges'],
+    optionsSuccessStatus: 200,
   }),
 );
 
@@ -143,6 +146,7 @@ app.use('/api/v1/categories', categoryRouter);
 app.use('/api/v1/streams', streamRouter);
 app.use('/api/v1/uploads', uploadRouter);
 app.use('/api/v1/tv', tvRouter);
+app.use('/api/v1/media', mediaRouter);
 
 app.use(notFoundHandler);
 app.use(errorHandler);

@@ -51,4 +51,9 @@ export const env = {
     'http://localhost:5173',
 
   uploadMaxMb: Number(process.env.UPLOAD_MAX_MB ?? 5),
+
+  mediaProxySecret:
+    process.env.MEDIA_PROXY_SECRET?.trim() ||
+    process.env.DB_PASSWORD ||
+    '',
 };
