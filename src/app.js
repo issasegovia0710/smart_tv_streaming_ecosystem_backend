@@ -11,6 +11,7 @@ import { assertDatabaseConnection } from './config/db.js';
 import { categoryRouter } from './routes/categoryRoutes.js';
 import { streamRouter } from './routes/streamRoutes.js';
 import { uploadRouter } from './routes/uploadRoutes.js';
+import { webPageRouter } from './routes/webPageRoutes.js';
 
 import { getCatalog } from './controllers/catalogController.js';
 import { asyncHandler } from './utils/asyncHandler.js';
@@ -41,7 +42,7 @@ app.use(
     origin(origin, callback) {
       // Aplicaciones de TV, Postman y peticiones servidor-servidor
       // pueden llegar sin encabezado Origin.
-      if (!origin) {
+      if (!origin || origin === 'null') {
         return callback(null, true);
       }
 
@@ -99,6 +100,7 @@ app.get('/', (req, res) => {
       catalog: '/api/v1/catalog',
       categories: '/api/v1/categories',
       streams: '/api/v1/streams',
+      webPageViewer: '/api/v1/web-pages/render?url=https://example.com',
     },
   });
 });
@@ -140,6 +142,7 @@ app.get(
 app.use('/api/v1/categories', categoryRouter);
 app.use('/api/v1/streams', streamRouter);
 app.use('/api/v1/uploads', uploadRouter);
+app.use('/api/v1/web-pages', webPageRouter);
 
 app.use(notFoundHandler);
 app.use(errorHandler);
