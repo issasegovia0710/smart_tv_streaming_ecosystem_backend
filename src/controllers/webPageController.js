@@ -215,7 +215,6 @@ function buildBridgeScript({ proxyEndpoint, mode }) {
 
   var PROXY_ENDPOINT = ${proxyJson};
   var MODE = ${modeJson};
-  var navigating = false;
 
   function absoluteUrl(value) {
     try {
@@ -229,159 +228,113 @@ function buildBridgeScript({ proxyEndpoint, mode }) {
     return /^https?:\\/\\//i.test(url);
   }
 
-  function showLoading() {
-    var existing = document.getElementById('tvstream-loading-overlay');
-    if (existing) return;
-
-    var overlay = document.createElement('div');
-    overlay.id = 'tvstream-loading-overlay';
-    overlay.setAttribute('style', [
-      'position:fixed!important',
-      'inset:0!important',
-      'z-index:2147483647!important',
-      'display:flex!important',
-      'align-items:center!important',
-      'justify-content:center!important',
-      'background:rgba(4,8,18,.88)!important',
-      'color:#fff!important',
-      'font:700 24px Arial,sans-serif!important'
-    ].join(';'));
-    overlay.textContent = 'Cargando página…';
-    document.documentElement.appendChild(overlay);
+  function proxyUrl(url) {
+    return PROXY_ENDPOINT +
+      '?mode=' + encodeURIComponent(MODE) +
+      '&url=' + encodeURIComponent(url);
   }
 
-  function showFailure(message) {
-    var overlay = document.getElementById('tvstream-loading-overlay');
-    if (!overlay) {
-      showLoading();
-      overlay = document.getElementById('tvstream-loading-overlay');
-    }
-    overlay.textContent = message || 'No se pudo cargar la página.';
-  }
+  function sendToHost(type, payload) {
+    if (MODE !== 'tv') return false;
 
-  function replaceDocument(html) {
-    document.open();
-    document.write(html);
-    document.close();
+    try {
+      if (window.parent && window.parent !== window) {
+        window.parent.postMessage({
+          source: 'tvstream-frame',
+          type: type,
+          payload: payload || {}
+        }, '*');
+        return true;
+      }
+    } catch (_) {}
+
+    return false;
   }
 
   function navigateInside(url) {
     var destination = absoluteUrl(url);
-    if (!canProxy(destination) || navigating) return false;
+    if (!canProxy(destination)) return false;
 
-    navigating = true;
-    showLoading();
+    if (sendToHost('navigate', { url: destination, title: document.title || '' })) {
+      return false;
+    }
 
-    var xhr = new XMLHttpRequest();
-    xhr.open(
-      'GET',
-      PROXY_ENDPOINT + '?mode=' + encodeURIComponent(MODE) + '&url=' + encodeURIComponent(destination),
-      true
-    );
-    xhr.timeout = 15000;
-    xhr.setRequestHeader('Accept', 'text/html');
-
-    xhr.onreadystatechange = function () {
-      if (xhr.readyState !== 4) return;
-      if (xhr.status >= 200 && xhr.status < 300) {
-        replaceDocument(xhr.responseText);
-        return;
-      }
-      navigating = false;
-      showFailure('No se pudo abrir el enlace. HTTP ' + xhr.status + '.');
-    };
-
-    xhr.onerror = function () {
-      navigating = false;
-      showFailure('No fue posible conectar con el servidor.');
-    };
-
-    xhr.ontimeout = function () {
-      navigating = false;
-      showFailure('La página tardó demasiado en responder.');
-    };
-
-    xhr.send();
+    window.location.replace(proxyUrl(destination));
     return false;
   }
 
-  window.__TVSTREAM_NAVIGATE__ = navigateInside;
-  window.open = function (url) {
+  function blockedWindowOpen(url) {
     if (url) navigateInside(url);
     return null;
-  };
+  }
 
-  function installToolbar() {
-    if (MODE !== 'tv' || document.getElementById('tvstream-toolbar')) return;
+  try {
+    Object.defineProperty(window, 'open', {
+      configurable: false,
+      enumerable: true,
+      writable: false,
+      value: blockedWindowOpen
+    });
+  } catch (_) {
+    window.open = blockedWindowOpen;
+  }
 
-    var toolbar = document.createElement('div');
-    toolbar.id = 'tvstream-toolbar';
-    toolbar.setAttribute('style', [
-      'position:fixed!important',
-      'top:0!important',
-      'left:0!important',
-      'right:0!important',
-      'height:58px!important',
-      'z-index:2147483646!important',
-      'display:flex!important',
-      'align-items:center!important',
-      'justify-content:space-between!important',
-      'box-sizing:border-box!important',
-      'padding:0 22px!important',
-      'background:rgba(7,12,24,.96)!important',
-      'color:#fff!important',
-      'font:600 19px Arial,sans-serif!important',
-      'border-bottom:1px solid rgba(255,255,255,.22)!important'
-    ].join(';'));
+  window.__TVSTREAM_NAVIGATE__ = navigateInside;
 
-    var label = document.createElement('span');
-    label.textContent = 'TV Stream · Página integrada';
+  function normalizeTargets(root) {
+    var scope = root && root.querySelectorAll ? root : document;
 
-    var button = document.createElement('button');
-    button.type = 'button';
-    button.textContent = 'Regresar';
-    button.setAttribute('style', [
-      'appearance:none!important',
-      'border:0!important',
-      'border-radius:9px!important',
-      'padding:10px 20px!important',
-      'background:#6675ff!important',
-      'color:#fff!important',
-      'font:700 18px Arial,sans-serif!important'
-    ].join(';'));
-    button.onclick = function () {
-      try { window.parent.postMessage({ type: 'tvstream-close' }, '*'); } catch (_) {}
-    };
+    var links = scope.querySelectorAll('a[target], area[target]');
+    for (var index = 0; index < links.length; index += 1) {
+      links[index].setAttribute('target', '_self');
+      links[index].removeAttribute('rel');
+    }
 
-    toolbar.appendChild(label);
-    toolbar.appendChild(button);
-    document.documentElement.appendChild(toolbar);
+    var forms = scope.querySelectorAll('form[target]');
+    for (var formIndex = 0; formIndex < forms.length; formIndex += 1) {
+      forms[formIndex].setAttribute('target', '_self');
+    }
 
-    try {
-      var bodyPadding = parseInt(window.getComputedStyle(document.body).paddingTop, 10) || 0;
-      document.body.style.setProperty('padding-top', (bodyPadding + 58) + 'px', 'important');
-    } catch (_) {}
+    var bases = scope.querySelectorAll('base[target]');
+    for (var baseIndex = 0; baseIndex < bases.length; baseIndex += 1) {
+      bases[baseIndex].removeAttribute('target');
+    }
   }
 
   document.addEventListener('click', function (event) {
     var element = event.target;
-    while (element && element !== document && String(element.tagName).toLowerCase() !== 'a') {
+
+    while (
+      element &&
+      element !== document &&
+      !/^(a|area)$/i.test(String(element.tagName || ''))
+    ) {
       element = element.parentNode;
     }
 
-    if (!element || !element.href) return;
+    if (!element) return;
 
-    var href = absoluteUrl(element.href);
+    var rawHref = element.getAttribute('href') || element.href || '';
+    var href = absoluteUrl(rawHref);
     if (!canProxy(href)) return;
 
     event.preventDefault();
     event.stopPropagation();
+    if (event.stopImmediatePropagation) event.stopImmediatePropagation();
     navigateInside(href);
   }, true);
 
   document.addEventListener('submit', function (event) {
     var form = event.target;
-    if (!form || String(form.method || 'get').toLowerCase() !== 'get') return;
+    if (!form) return;
+
+    var method = String(form.method || 'get').toLowerCase();
+    if (method !== 'get') {
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.stopImmediatePropagation) event.stopImmediatePropagation();
+      return;
+    }
 
     var action = absoluteUrl(form.action || document.baseURI);
     if (!canProxy(action)) return;
@@ -389,27 +342,51 @@ function buildBridgeScript({ proxyEndpoint, mode }) {
     try {
       var query = new URLSearchParams(new FormData(form));
       var destination = new URL(action);
-      query.forEach(function (value, key) { destination.searchParams.append(key, value); });
+      query.forEach(function (value, key) {
+        destination.searchParams.append(key, value);
+      });
+
       event.preventDefault();
       event.stopPropagation();
+      if (event.stopImmediatePropagation) event.stopImmediatePropagation();
       navigateInside(destination.toString());
     } catch (_) {}
   }, true);
 
   document.addEventListener('DOMContentLoaded', function () {
-    var links = document.querySelectorAll('a[target]');
-    for (var index = 0; index < links.length; index += 1) {
-      links[index].setAttribute('target', '_self');
+    normalizeTargets(document);
+
+    if (window.MutationObserver) {
+      var observer = new MutationObserver(function (mutations) {
+        for (var index = 0; index < mutations.length; index += 1) {
+          var added = mutations[index].addedNodes || [];
+          for (var nodeIndex = 0; nodeIndex < added.length; nodeIndex += 1) {
+            var node = added[nodeIndex];
+            if (node && node.nodeType === 1) normalizeTargets(node);
+          }
+        }
+      });
+
+      observer.observe(document.documentElement, {
+        childList: true,
+        subtree: true
+      });
     }
-    installToolbar();
+
+    sendToHost('ready', {
+      title: document.title || '',
+      url: document.baseURI || ''
+    });
   });
 
   window.addEventListener('keydown', function (event) {
     var code = event.keyCode || event.which;
+
     if (MODE === 'tv' && (code === 10009 || code === 27 || event.key === 'Escape')) {
       event.preventDefault();
       event.stopPropagation();
-      try { window.parent.postMessage({ type: 'tvstream-close' }, '*'); } catch (_) {}
+      if (event.stopImmediatePropagation) event.stopImmediatePropagation();
+      sendToHost('close', {});
     }
   }, true);
 })();
@@ -419,10 +396,11 @@ function buildBridgeScript({ proxyEndpoint, mode }) {
 function injectIntoHtml(html, finalUrl, bridgeScript) {
   let output = html
     .replace(/<meta\b[^>]*http-equiv\s*=\s*["']?content-security-policy["']?[^>]*>/gi, '')
+    .replace(/<meta\b[^>]*http-equiv\s*=\s*["']?refresh["']?[^>]*>/gi, '')
     .replace(/<base\b[^>]*>/gi, '')
-    .replace(/<meta\b[^>]*http-equiv\s*=\s*["']?refresh["']?[^>]*>/gi, '');
+    .replace(/\s+target\s*=\s*["'](?:_blank|_top|_parent)["']/gi, ' target="_self"');
 
-  const injection = `<base href="${escapeHtmlAttribute(finalUrl)}" target="_self">${bridgeScript}`;
+  const injection = `<base href="${escapeHtmlAttribute(finalUrl)}">${bridgeScript}`;
 
   if (/<head\b[^>]*>/i.test(output)) {
     return output.replace(/<head\b[^>]*>/i, (match) => `${match}${injection}`);
@@ -460,15 +438,11 @@ export async function renderWebPage(req, res) {
   res.removeHeader('Cross-Origin-Opener-Policy');
   res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
   res.setHeader('Cache-Control', 'no-store, max-age=0');
+  res.setHeader('Content-Disposition', 'inline');
   res.setHeader('Referrer-Policy', 'no-referrer-when-downgrade');
-  const sandboxPolicy = mode === 'tv'
-    ? 'sandbox allow-scripts allow-forms allow-same-origin allow-presentation allow-modals; '
-    : '';
-
   res.setHeader(
     'Content-Security-Policy',
-    sandboxPolicy +
-      "default-src * data: blob: 'unsafe-inline' 'unsafe-eval'; connect-src * data: blob:; img-src * data: blob:; media-src * data: blob:; frame-src * data: blob:; child-src * data: blob:; style-src * 'unsafe-inline'; script-src * 'unsafe-inline' 'unsafe-eval'; frame-ancestors *;",
+    "default-src * data: blob: 'unsafe-inline' 'unsafe-eval'; connect-src * data: blob:; img-src * data: blob:; media-src * data: blob:; frame-src * data: blob:; child-src * data: blob:; style-src * 'unsafe-inline'; script-src * 'unsafe-inline' 'unsafe-eval'; frame-ancestors *;",
   );
   res.type('html').send(renderedHtml);
 }
