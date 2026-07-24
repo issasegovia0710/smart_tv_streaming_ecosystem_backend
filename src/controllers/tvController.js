@@ -1,8 +1,9 @@
 import { pool } from '../config/db.js';
 import { resolveWebMedia } from './streamTestController.js';
 import { HttpError } from '../utils/httpError.js';
+import { decorateResolvedMedia, validateMediaCandidate } from '../services/mediaGateway.js';
 
-const DEFAULT_APP_VERSION = '1.6.0';
+const DEFAULT_APP_VERSION = '1.7.0';
 const DEFAULT_REFRESH_INTERVAL_MS = 180000;
 
 function parseVersion(value) {
@@ -125,23 +126,48 @@ export async function getTvChannelPlayback(req, res) {
   const playbackUrl = String(stream.playbackUrl || '').trim();
 
   if (isDirectMediaType(stream.streamType, playbackUrl)) {
-    return res.json({
-      ok: true,
-      data: {
-        resolved: true,
-        streamId: stream.id,
-        title: stream.title,
-        playbackUrl,
-        resolvedType: directType(stream.streamType, playbackUrl),
-        resolverEngine: stream.explicitPlaybackUrl
-          ? 'configured-playback-url'
-          : 'direct-source',
+    const requestedType = directType(stream.streamType, playbackUrl);
+    const validation = await validateMediaCandidate(
+      {
+        url: playbackUrl,
+        type: requestedType,
+        // Cuando playback_url es un endpoint .php/.html autorizado, la página
+        // fuente puede ser el Referer que exige el servidor multimedia.
+        referer: stream.sourceUrl || '',
         cookieHeader: '',
         userAgent: '',
-        referer: stream.sourceUrl || '',
-        message: 'Flujo directo listo para reproducir.',
       },
+      { timeoutMs: 9000 },
+    );
+
+    if (!validation.valid) {
+      throw new HttpError(
+        422,
+        `La URL configurada como ${requestedType.toUpperCase()} no devolvió un flujo reproducible: ${validation.reason || 'validación fallida'}`,
+      );
+    }
+
+    const resolution = decorateResolvedMedia(req, {
+      resolved: true,
+      streamId: stream.id,
+      title: stream.title,
+      playbackUrl: validation.finalUrl || playbackUrl,
+      resolvedType: validation.type || requestedType,
+      resolverEngine: stream.explicitPlaybackUrl
+        ? 'configured-playback-url-validated'
+        : 'direct-source-validated',
+      cookieHeader: '',
+      userAgent: '',
+      referer: stream.sourceUrl || '',
+      validation,
+      message:
+        requestedType === 'hls'
+          ? 'Flujo HLS validado y preparado mediante el backend.'
+          : `Flujo ${requestedType.toUpperCase()} validado.`,
     });
+
+    res.set('Cache-Control', 'no-store, max-age=0');
+    return res.json({ ok: true, data: resolution });
   }
 
   if (String(stream.streamType || '').toLowerCase() !== 'web') {
@@ -151,9 +177,10 @@ export async function getTvChannelPlayback(req, res) {
     );
   }
 
-  const resolution = await resolveWebMedia(stream.sourceUrl, {
+  const rawResolution = await resolveWebMedia(stream.sourceUrl, {
     forceRefresh: req.query.refresh === '1' || req.query.refresh === 'true',
   });
+  const resolution = decorateResolvedMedia(req, rawResolution);
 
   res.set('Cache-Control', 'no-store, max-age=0');
   return res.json({
