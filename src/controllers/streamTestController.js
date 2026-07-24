@@ -1,13 +1,14 @@
 import dns from 'node:dns/promises';
 import net from 'node:net';
 
+import { resolveStreamWithBrowser } from '../services/browserStreamResolver.js';
 import { HttpError } from '../utils/httpError.js';
 
 const MAX_REDIRECTS = 4;
 const MAX_BYTES = 256 * 1024;
-const REQUEST_TIMEOUT_MS = 6500;
-const RESOLVE_MAX_DEPTH = 3;
-const RESOLVE_MAX_REQUESTS = 12;
+const REQUEST_TIMEOUT_MS = 4000;
+const RESOLVE_MAX_DEPTH = 1;
+const RESOLVE_MAX_REQUESTS = 3;
 
 function isPrivateIpv4(address) {
   const parts = address.split('.').map(Number);
@@ -367,6 +368,12 @@ async function resolveWebMedia(rawUrl) {
           sourcePageUrl: startUrl.toString(),
           resolvedFrom: current.referer || startUrl.toString(),
           requests,
+          resolverEngine: 'static',
+          cookieHeader: '',
+          userAgent: '',
+          referer: current.referer || startUrl.toString(),
+          warning: '',
+          browserDiagnostics: null,
           message: `Flujo ${detectedType.toUpperCase()} encontrado.`,
         };
       }
@@ -399,14 +406,28 @@ async function resolveWebMedia(rawUrl) {
     }
   }
 
+  const browserResolution = await resolveStreamWithBrowser(startUrl.toString());
+
+  if (browserResolution.resolved) {
+    return {
+      ...browserResolution,
+      sourcePageUrl: startUrl.toString(),
+      resolvedFrom: browserResolution.referer || lastReachablePage || startUrl.toString(),
+      requests,
+      staticRequests: requests,
+      browserAttempted: true,
+    };
+  }
+
   return {
-    resolved: false,
-    playbackUrl: null,
-    resolvedType: null,
+    ...browserResolution,
     sourcePageUrl: startUrl.toString(),
     resolvedFrom: lastReachablePage,
     requests,
+    staticRequests: requests,
+    browserAttempted: true,
     message:
+      browserResolution.message ||
       'La página respondió, pero no se encontró una URL directa HLS, DASH o MP4. La app no abrirá el navegador.',
   };
 }
@@ -426,6 +447,12 @@ function diagnosticFailure(error, requestedType) {
     child: null,
     resolvedPlaybackUrl: null,
     resolvedType: null,
+    resolverEngine: null,
+    cookieHeader: '',
+    userAgent: '',
+    referer: '',
+    warning: '',
+    browserDiagnostics: null,
     message: error.message || 'No fue posible comprobar la fuente.',
   };
 }
@@ -476,6 +503,37 @@ export async function testStream(req, res) {
     throw new HttpError(400, 'La URL no tiene un formato válido.');
   }
 
+  if (requestedType === 'web') {
+    const resolution = await resolveWebMedia(rawUrl);
+
+    return res.json({
+      ok: true,
+      data: {
+        reachable: Boolean(resolution.resolvedFrom || resolution.resolved),
+        looksPlayable: Boolean(resolution.resolved),
+        requestedType: 'web',
+        detectedType: 'html',
+        status: resolution.resolved ? 200 : null,
+        finalUrl: resolution.sourcePageUrl || rawUrl,
+        contentType: 'text/html',
+        contentLength: null,
+        bytesInspected: 0,
+        hls: null,
+        child: null,
+        resolvedPlaybackUrl: resolution.playbackUrl,
+        resolvedType: resolution.resolvedType,
+        resolverEngine: resolution.resolverEngine || 'static',
+        cookieHeader: resolution.cookieHeader || '',
+        userAgent: resolution.userAgent || '',
+        referer: resolution.referer || '',
+        warning: resolution.warning || '',
+        browserDiagnostics: resolution.browserDiagnostics || null,
+        resolverRequests: resolution.requests || 0,
+        message: resolution.message,
+      },
+    });
+  }
+
   let fetched;
   try {
     fetched = await fetchLimited(parsedUrl);
@@ -492,38 +550,20 @@ export async function testStream(req, res) {
   const text = body.toString('utf8');
   const detectedType = detectType(finalUrl, contentType, text);
   const hls = detectedType === 'hls' ? inspectHls(text, finalUrl) : null;
-  const requestedAsWeb = requestedType === 'web';
+  const looksPlayable = response.ok &&
+    detectedType !== 'html' &&
+    detectedType !== 'other' &&
+    (!hls || hls.valid);
 
-  let resolution = {
-    resolved: false,
-    playbackUrl: null,
-    resolvedType: null,
-    message: '',
-  };
-
-  if (requestedAsWeb && response.ok) {
-    resolution = await resolveWebMedia(rawUrl);
-  }
-
-  const looksPlayable = response.ok && (
-    requestedAsWeb
-      ? resolution.resolved
-      : detectedType !== 'html' &&
-        detectedType !== 'other' &&
-        (!hls || hls.valid)
-  );
-
-  let message = requestedAsWeb
-    ? resolution.message
-    : 'La fuente respondió correctamente.';
+  let message = 'La fuente respondió correctamente.';
 
   if (!response.ok) {
     message = `La fuente respondió HTTP ${response.status}.`;
-  } else if (!requestedAsWeb && detectedType === 'html') {
+  } else if (detectedType === 'html') {
     message = 'La URL devolvió una página HTML, no un stream directo.';
-  } else if (!requestedAsWeb && detectedType === 'other') {
+  } else if (detectedType === 'other') {
     message = 'La respuesta no parece ser HLS, DASH o video MP4.';
-  } else if (!requestedAsWeb && hls && !hls.valid) {
+  } else if (hls && !hls.valid) {
     message = 'La respuesta parece HLS, pero el manifiesto no inicia con #EXTM3U.';
   }
 
@@ -541,9 +581,15 @@ export async function testStream(req, res) {
       bytesInspected: body.length,
       hls,
       child: null,
-      resolvedPlaybackUrl: resolution.playbackUrl,
-      resolvedType: resolution.resolvedType,
-      resolverRequests: resolution.requests || 0,
+      resolvedPlaybackUrl: null,
+      resolvedType: null,
+      resolverEngine: 'direct',
+      cookieHeader: '',
+      userAgent: '',
+      referer: '',
+      warning: '',
+      browserDiagnostics: null,
+      resolverRequests: 0,
       message,
     },
   });
