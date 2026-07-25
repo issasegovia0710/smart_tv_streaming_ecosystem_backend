@@ -1,0 +1,13 @@
+{
+  "name": "TV Stream",
+  "icon": "/branding/tv-stream-512.png",
+  "sizes": [
+    32,
+    64,
+    128,
+    192,
+    256,
+    512,
+    1024
+  ]
+}

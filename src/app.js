@@ -1,4 +1,4 @@
-import path from 'node:path';
+﻿import path from 'node:path';
 
 import express from 'express';
 import cors from 'cors';
@@ -78,8 +78,16 @@ app.use(morgan('combined'));
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true }));
 
+app.use(express.static(path.resolve('public'), {
+  maxAge: '30d',
+}));
+
+app.use(express.static(path.resolve('public'), {
+  maxAge: '30d',
+}));
+
 // En Vercel express.static() no conserva archivos subidos.
-// Se mantiene para desarrollo local. En producción usa URL externa
+// Se mantiene para desarrollo local. En producciÃ³n usa URL externa
 // para las portadas, por ejemplo Cloudinary, S3 o Vercel Blob.
 if (!process.env.VERCEL) {
   app.use(
@@ -90,7 +98,7 @@ if (!process.env.VERCEL) {
   );
 }
 
-// Ruta raíz: comprueba que Express arrancó sin tocar la base.
+// Ruta raÃ­z: comprueba que Express arrancÃ³ sin tocar la base.
 app.get('/', (req, res) => {
   res.json({
     ok: true,
@@ -108,7 +116,7 @@ app.get('/', (req, res) => {
   });
 });
 
-// Salud básica: no consulta TiDB.
+// Salud bÃ¡sica: no consulta TiDB.
 app.get('/api/v1/health', (req, res) => {
   res.json({
     ok: true,
@@ -118,7 +126,7 @@ app.get('/api/v1/health', (req, res) => {
   });
 });
 
-// Salud completa: prueba la conexión TLS con TiDB.
+// Salud completa: prueba la conexiÃ³n TLS con TiDB.
 app.get(
   '/api/v1/health/database',
   asyncHandler(async (req, res) => {
@@ -152,3 +160,5 @@ app.use(notFoundHandler);
 app.use(errorHandler);
 
 export default app;
+
+
