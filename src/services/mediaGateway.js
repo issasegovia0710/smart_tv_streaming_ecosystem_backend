@@ -450,6 +450,89 @@ export async function validateMediaCandidate(candidate, options = {}) {
   }
 }
 
+
+function asciiAt(buffer, start, length) {
+  if (!buffer || buffer.length < start + length) return '';
+  return buffer.subarray(start, start + length).toString('ascii');
+}
+
+function looksLikeTransportStream(buffer) {
+  if (!buffer || buffer.length < 1) return false;
+  const offsets = [0, 188, 376];
+  let matches = 0;
+  for (const offset of offsets) {
+    if (buffer.length > offset && buffer[offset] === 0x47) matches += 1;
+  }
+  return matches >= (buffer.length > 188 ? 2 : 1);
+}
+
+function sniffMediaContentType(buffer, upstreamContentType = '', finalUrl = '') {
+  const upstream = String(upstreamContentType || '').split(';')[0].trim().toLowerCase();
+  const url = String(finalUrl || '').toLowerCase();
+
+  if (looksLikeTransportStream(buffer)) return 'video/mp2t';
+
+  const box = asciiAt(buffer, 4, 4);
+  if (
+    ['ftyp', 'styp', 'moof', 'sidx'].includes(box) ||
+    ['ftyp', 'styp', 'moof', 'sidx'].includes(asciiAt(buffer, 0, 4))
+  ) {
+    return 'video/mp4';
+  }
+
+  if (buffer?.length >= 2 && buffer[0] === 0xff && (buffer[1] & 0xf6) === 0xf0) {
+    return 'audio/aac';
+  }
+
+  if (asciiAt(buffer, 0, 3) === 'ID3') return 'audio/mpeg';
+  if (asciiAt(buffer, 0, 6) === 'WEBVTT') return 'text/vtt; charset=utf-8';
+
+  if (/\.(?:ts|m2ts)(?:$|[?#])/i.test(url)) return 'video/mp2t';
+  if (/\.(?:m4s|mp4|cmfv|cmfa)(?:$|[?#])/i.test(url)) return 'video/mp4';
+  if (/\.(?:aac)(?:$|[?#])/i.test(url)) return 'audio/aac';
+  if (/\.(?:vtt)(?:$|[?#])/i.test(url)) return 'text/vtt; charset=utf-8';
+
+  // Algunos CDN publican segmentos HLS con extensión .image y tipo image/*.
+  // No enviamos ese MIME falso a AVPlay. Si la firma no fue reconocida,
+  // application/octet-stream permite que el reproductor inspeccione el contenedor.
+  if (url.includes('.image') || upstream.startsWith('image/')) {
+    return 'application/octet-stream';
+  }
+
+  return upstream || 'application/octet-stream';
+}
+
+async function pipeBodyWithSniff(response, res, finalUrl) {
+  if (!response.body) return res.end();
+
+  const reader = response.body.getReader();
+  const first = await reader.read();
+  const firstBuffer = first.done || !first.value
+    ? Buffer.alloc(0)
+    : Buffer.from(first.value);
+  const upstreamType = response.headers.get('content-type') || '';
+  const detectedType = sniffMediaContentType(firstBuffer, upstreamType, finalUrl);
+
+  res.set('Content-Type', detectedType);
+  // fetch puede descomprimir la respuesta. Para evitar longitudes incorrectas,
+  // no reenviamos content-length cuando el cuerpo se canaliza manualmente.
+  res.removeHeader('Content-Length');
+
+  const output = Readable.from((async function* streamBody() {
+    if (firstBuffer.length) yield firstBuffer;
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      if (next.value?.byteLength) yield Buffer.from(next.value);
+    }
+  })());
+
+  output.on('error', () => {
+    try { res.destroy(); } catch {}
+  });
+  return output.pipe(res);
+}
+
 function rewriteHls(text, baseUrl, req, headers, expiresAt) {
   const rewrite = (value) => {
     try {
@@ -511,11 +594,11 @@ export async function proxyMedia(req, res) {
   }
 
   res.status(response.status);
-  for (const name of ['content-type', 'content-length', 'content-range', 'accept-ranges', 'cache-control']) {
+  for (const name of ['content-range', 'accept-ranges', 'cache-control', 'etag', 'last-modified']) {
     const value = response.headers.get(name);
     if (value) res.set(name, value);
   }
 
   if (!response.body) return res.end();
-  return Readable.fromWeb(response.body).pipe(res);
+  return pipeBodyWithSniff(response, res, finalUrl);
 }
