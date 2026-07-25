@@ -4,6 +4,18 @@ import { toSlug } from '../utils/slug.js';
 
 const allowedTypes = new Set(['hls', 'mp4', 'rtmp', 'dash', 'web', 'other']);
 
+
+function parseMetadata(value) {
+  if (!value) return {};
+  if (typeof value === 'object') return value;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
 function nullableDate(value) {
   if (value === null || value === undefined || value === '') return null;
   const date = new Date(value);
@@ -138,6 +150,7 @@ export async function listStreams(req, res) {
 
     return {
       ...row,
+      metadata: parseMetadata(row.metadata),
       categories: Array.isArray(categories) ? categories.filter(Boolean) : [],
     };
   });
@@ -181,7 +194,14 @@ export async function getStream(req, res) {
     [req.params.id],
   );
 
-  res.json({ ok: true, data: { ...rows[0], categories } });
+  res.json({
+    ok: true,
+    data: {
+      ...rows[0],
+      metadata: parseMetadata(rows[0].metadata),
+      categories,
+    },
+  });
 }
 
 export async function createStream(req, res) {

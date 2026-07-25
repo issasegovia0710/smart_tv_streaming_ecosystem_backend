@@ -2,6 +2,8 @@ import dns from 'node:dns/promises';
 import { existsSync } from 'node:fs';
 import net from 'node:net';
 
+import { validateMediaCandidate } from './mediaGateway.js';
+
 const DEFAULT_TIMEOUT_MS = 24000;
 const NETWORK_SETTLE_MS = 6500;
 const CACHE_TTL_MS = 2 * 60 * 1000;
@@ -302,7 +304,14 @@ function cacheSet(url, value) {
 }
 
 export async function resolveStreamWithBrowser(rawUrl, options = {}) {
-  const cached = options.forceRefresh ? null : cacheGet(rawUrl);
+  const configuredHeaders = options.playbackHeaders && typeof options.playbackHeaders === 'object'
+    ? options.playbackHeaders
+    : {};
+  const configuredUserAgent = String(configuredHeaders.userAgent || DEFAULT_USER_AGENT).slice(0, 500);
+  const configuredReferer = String(configuredHeaders.referer || '').slice(0, 1500);
+  const configuredOrigin = String(configuredHeaders.origin || '').slice(0, 1000);
+  const cacheKey = `${rawUrl}::${configuredReferer}::${configuredOrigin}::${configuredUserAgent}`;
+  const cached = options.forceRefresh ? null : cacheGet(cacheKey);
   if (cached) return cached;
 
   const startedAt = Date.now();
@@ -334,7 +343,8 @@ export async function resolveStreamWithBrowser(rawUrl, options = {}) {
       status: Number(candidate.status || 0),
       referer: candidate.referer || '',
       cookie: candidate.cookie || '',
-      userAgent: candidate.userAgent || DEFAULT_USER_AGENT,
+      userAgent: candidate.userAgent || configuredUserAgent,
+      origin: candidate.origin || configuredOrigin,
       resourceType: candidate.resourceType || '',
     };
     normalizedCandidate.score = scoreCandidate(normalizedCandidate);
@@ -376,7 +386,8 @@ export async function resolveStreamWithBrowser(rawUrl, options = {}) {
           contentType: 'application/vnd.apple.mpegurl',
           referer: requestHeaders.referer || '',
           cookie: requestHeaders.cookie || '',
-          userAgent: requestHeaders['user-agent'] || DEFAULT_USER_AGENT,
+          userAgent: requestHeaders['user-agent'] || configuredUserAgent,
+          origin: requestHeaders.origin || configuredOrigin,
           resourceType,
         });
       } else if (/^<\?xml[\s\S]*?<MPD\b|^<MPD\b/i.test(trimmedBody)) {
@@ -386,7 +397,8 @@ export async function resolveStreamWithBrowser(rawUrl, options = {}) {
           contentType: 'application/dash+xml',
           referer: requestHeaders.referer || '',
           cookie: requestHeaders.cookie || '',
-          userAgent: requestHeaders['user-agent'] || DEFAULT_USER_AGENT,
+          userAgent: requestHeaders['user-agent'] || configuredUserAgent,
+          origin: requestHeaders.origin || configuredOrigin,
           resourceType,
         });
       }
@@ -398,7 +410,8 @@ export async function resolveStreamWithBrowser(rawUrl, options = {}) {
           contentType: '',
           referer: requestHeaders.referer || '',
           cookie: requestHeaders.cookie || '',
-          userAgent: requestHeaders['user-agent'] || DEFAULT_USER_AGENT,
+          userAgent: requestHeaders['user-agent'] || configuredUserAgent,
+          origin: requestHeaders.origin || configuredOrigin,
           resourceType,
         });
       }
@@ -413,7 +426,7 @@ export async function resolveStreamWithBrowser(rawUrl, options = {}) {
     resolverEngine = launched.engine;
 
     context = await browser.newContext({
-      userAgent: DEFAULT_USER_AGENT,
+      userAgent: configuredUserAgent,
       viewport: { width: 1920, height: 1080 },
       ignoreHTTPSErrors: true,
       javaScriptEnabled: true,
@@ -423,6 +436,8 @@ export async function resolveStreamWithBrowser(rawUrl, options = {}) {
       extraHTTPHeaders: {
         Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'es-MX,es;q=0.9,en;q=0.7',
+        ...(configuredReferer ? { Referer: configuredReferer } : {}),
+        ...(configuredOrigin ? { Origin: configuredOrigin } : {}),
       },
     });
 
@@ -467,7 +482,8 @@ export async function resolveStreamWithBrowser(rawUrl, options = {}) {
             status: 0,
             referer: headers.referer || '',
             cookie: headers.cookie || '',
-            userAgent: headers['user-agent'] || DEFAULT_USER_AGENT,
+            userAgent: headers['user-agent'] || configuredUserAgent,
+            origin: headers.origin || configuredOrigin,
             resourceType: request.resourceType(),
           });
         })();
@@ -488,7 +504,8 @@ export async function resolveStreamWithBrowser(rawUrl, options = {}) {
             status: response.status(),
             referer: requestHeaders.referer || '',
             cookie: requestHeaders.cookie || '',
-            userAgent: requestHeaders['user-agent'] || DEFAULT_USER_AGENT,
+            userAgent: requestHeaders['user-agent'] || configuredUserAgent,
+            origin: requestHeaders.origin || configuredOrigin,
             resourceType: request.resourceType(),
           });
 
@@ -647,25 +664,54 @@ export async function resolveStreamWithBrowser(rawUrl, options = {}) {
 
     for (const value of frameUrls) addCandidate({ url: value, resourceType: 'dom-frame' });
 
-    const sortedCandidates = [...candidates.values()].sort((a, b) => b.score - a.score);
-    const selected = sortedCandidates.find((candidate) => candidate.score > 20);
+    const sortedCandidates = [...candidates.values()]
+      .filter((candidate) => candidate.score > 20)
+      .sort((a, b) => b.score - a.score);
+
+    const candidatesToValidate = sortedCandidates.slice(0, 6);
+    const validationResults = await Promise.all(
+      candidatesToValidate.map(async (candidate) => {
+        let enrichedCandidate = candidate;
+        if (!candidate.cookie) {
+          const candidateCookies = await context.cookies(candidate.url).catch(() => []);
+          const cookie = candidateCookies
+            .map((item) => `${item.name}=${item.value}`)
+            .join('; ');
+          if (cookie) enrichedCandidate = { ...candidate, cookie };
+        }
+
+        return {
+          candidate: enrichedCandidate,
+          validation: await validateMediaCandidate(enrichedCandidate, { timeoutMs: 6000 }),
+        };
+      }),
+    );
+    const validated = validationResults.find((entry) => entry.validation.valid);
+    const selected = validated?.candidate || null;
+    const selectedValidation = validated?.validation || null;
 
     if (!selected) {
+      const rejectedReasons = validationResults
+        .map((entry) => entry.validation.reason)
+        .filter(Boolean)
+        .slice(0, 3);
       const failure = buildFailure(
         navigationError
-          ? `La página no terminó de cargar (${navigationError}), y no emitió una solicitud HLS, DASH o MP4 reproducible.`
-          : 'La página cargó y ejecutó JavaScript, pero no emitió una solicitud HLS, DASH o MP4 reproducible.',
+          ? `La página no terminó de cargar (${navigationError}) y ningún flujo detectado superó la validación.`
+          : 'La página cargó y emitió candidatos multimedia, pero ninguno pudo abrir su manifiesto y primer segmento.',
         {
           resolverEngine,
+          warning: rejectedReasons.join(' | '),
           browserDiagnostics: {
             candidateCount: sortedCandidates.length,
+            candidatesValidated: candidatesToValidate.length,
             requestsObserved,
             pagesOpened,
             elapsedMs: Date.now() - startedAt,
           },
         },
       );
-      cacheSet(rawUrl, failure);
+      cacheSet(cacheKey, failure);
       return failure;
     }
 
@@ -685,11 +731,13 @@ export async function resolveStreamWithBrowser(rawUrl, options = {}) {
       playbackUrl: selected.url,
       resolvedType: selected.type,
       cookieHeader,
-      userAgent: selected.userAgent || DEFAULT_USER_AGENT,
-      referer: selected.referer || rawUrl,
+      userAgent: selected.userAgent || configuredUserAgent,
+      referer: selected.referer || configuredReferer || rawUrl,
+      origin: selected.origin || configuredOrigin,
       resolverEngine,
       browserDiagnostics: {
         candidateCount: sortedCandidates.length,
+        candidatesValidated: candidatesToValidate.length,
         requestsObserved,
         pagesOpened,
         elapsedMs: Date.now() - startedAt,
@@ -697,13 +745,15 @@ export async function resolveStreamWithBrowser(rawUrl, options = {}) {
         selectedStatus: selected.status,
         selectedContentType: selected.contentType,
       },
+      validation: selectedValidation,
+      requiresProxy: selected.type === 'hls',
       warning: refererRequired
         ? 'El servidor multimedia recibió Referer durante la detección. AVPlay puede reproducir si la URL o las cookies bastan; si exige Referer estricto, la fuente debe autorizar la TV o proporcionar un enlace directo.'
         : '',
-      message: `Flujo ${selected.type.toUpperCase()} detectado después de ejecutar la página.`,
+      message: `Flujo ${selected.type.toUpperCase()} detectado y validado después de ejecutar la página.`,
     };
 
-    cacheSet(rawUrl, result);
+    cacheSet(cacheKey, result);
     return result;
   } catch (error) {
     return buildFailure(

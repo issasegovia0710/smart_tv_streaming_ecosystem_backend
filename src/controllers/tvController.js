@@ -3,8 +3,33 @@ import { resolveWebMedia } from './streamTestController.js';
 import { HttpError } from '../utils/httpError.js';
 import { decorateResolvedMedia, validateMediaCandidate } from '../services/mediaGateway.js';
 
-const DEFAULT_APP_VERSION = '1.7.0';
+const DEFAULT_APP_VERSION = '1.8.0';
 const DEFAULT_REFRESH_INTERVAL_MS = 180000;
+
+
+function parseMetadata(value) {
+  if (!value) return {};
+  if (typeof value === 'object') return value;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function playbackHeadersFromMetadata(metadata, sourceUrl) {
+  const parsed = parseMetadata(metadata);
+  const configured = parsed.playbackHeaders && typeof parsed.playbackHeaders === 'object'
+    ? parsed.playbackHeaders
+    : {};
+
+  return {
+    referer: String(configured.referer || sourceUrl || '').trim(),
+    origin: String(configured.origin || '').trim(),
+    userAgent: String(configured.userAgent || '').trim(),
+  };
+}
 
 function parseVersion(value) {
   return String(value || '0')
@@ -83,10 +108,10 @@ export async function getTvBootstrap(req, res) {
       appUpdateRequired:
         compareVersions(minimumAppVersion, installedAppVersion) > 0,
       canInstallBinaryFromBackend: false,
-      binaryUpdateMode: 'samsung-store-or-sdb',
+      binaryUpdateMode: 'manual-sdb',
       updateMessage:
         process.env.TV_UPDATE_MESSAGE ||
-        'Los canales y la configuración se actualizan desde el servidor.',
+        'Actualizar recarga canales y configuración. El paquete de la app solo cambia mediante instalación manual.',
       catalogUrl: '/api/v1/catalog',
       refreshIntervalMs: Math.max(
         60000,
@@ -110,6 +135,7 @@ export async function getTvChannelPlayback(req, res) {
         playback_url AS explicitPlaybackUrl,
         COALESCE(playback_url, source_url) AS playbackUrl,
         stream_type AS streamType,
+        metadata,
         is_active AS isActive
       FROM streams
       WHERE id = ?
@@ -124,6 +150,7 @@ export async function getTvChannelPlayback(req, res) {
 
   const stream = rows[0];
   const playbackUrl = String(stream.playbackUrl || '').trim();
+  const playbackHeaders = playbackHeadersFromMetadata(stream.metadata, stream.sourceUrl);
 
   if (isDirectMediaType(stream.streamType, playbackUrl)) {
     const requestedType = directType(stream.streamType, playbackUrl);
@@ -133,9 +160,10 @@ export async function getTvChannelPlayback(req, res) {
         type: requestedType,
         // Cuando playback_url es un endpoint .php/.html autorizado, la página
         // fuente puede ser el Referer que exige el servidor multimedia.
-        referer: stream.sourceUrl || '',
+        referer: playbackHeaders.referer,
+        origin: playbackHeaders.origin,
         cookieHeader: '',
-        userAgent: '',
+        userAgent: playbackHeaders.userAgent,
       },
       { timeoutMs: 9000 },
     );
@@ -157,8 +185,9 @@ export async function getTvChannelPlayback(req, res) {
         ? 'configured-playback-url-validated'
         : 'direct-source-validated',
       cookieHeader: '',
-      userAgent: '',
-      referer: stream.sourceUrl || '',
+      userAgent: playbackHeaders.userAgent,
+      referer: playbackHeaders.referer,
+      origin: playbackHeaders.origin,
       validation,
       message:
         requestedType === 'hls'
@@ -179,6 +208,7 @@ export async function getTvChannelPlayback(req, res) {
 
   const rawResolution = await resolveWebMedia(stream.sourceUrl, {
     forceRefresh: req.query.refresh === '1' || req.query.refresh === 'true',
+    playbackHeaders,
   });
   const resolution = decorateResolvedMedia(req, rawResolution);
 

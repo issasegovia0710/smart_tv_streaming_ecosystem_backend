@@ -132,6 +132,7 @@ function sanitizedHeaders(input = {}) {
   return {
     userAgent: String(input.userAgent || DEFAULT_USER_AGENT).slice(0, 500),
     referer: String(input.referer || '').slice(0, 1500),
+    origin: String(input.origin || '').slice(0, 1000),
     cookie: String(input.cookieHeader || input.cookie || '').slice(0, 6000),
   };
 }
@@ -177,6 +178,7 @@ function upstreamHeaders(input = {}, extra = {}) {
     ...extra,
   };
   if (input.referer) headers.Referer = input.referer;
+  if (input.origin) headers.Origin = input.origin;
   if (input.cookie) headers.Cookie = input.cookie;
   return headers;
 }
@@ -258,6 +260,54 @@ async function readFirstChunk(response) {
   }
 }
 
+
+function inspectHlsProtection(manifest) {
+  const entries = [];
+  const unsupported = [];
+
+  for (const rawLine of String(manifest || '').split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!/^#EXT-X-(?:SESSION-)?KEY:/i.test(line)) continue;
+
+    const method = (line.match(/METHOD=([^,]+)/i)?.[1] || '').replace(/["']/g, '').toUpperCase();
+    const keyFormat = (line.match(/KEYFORMAT=(?:"([^"]+)"|'([^']+)'|([^,]+))/i)?.slice(1).find(Boolean) || 'identity').trim();
+    const normalizedFormat = keyFormat.toLowerCase();
+    const item = { method, keyFormat };
+    entries.push(item);
+
+    const identityAes128 = method === 'AES-128' && (normalizedFormat === 'identity' || normalizedFormat === '');
+    const unencrypted = !method || method === 'NONE';
+    if (!identityAes128 && !unencrypted) unsupported.push(item);
+  }
+
+  return {
+    protected: entries.length > 0,
+    supportedByProxy: unsupported.length === 0,
+    entries,
+    unsupported,
+  };
+}
+
+function inspectDashProtection(manifest) {
+  const text = String(manifest || '');
+  const schemes = [...text.matchAll(/<ContentProtection\b[^>]*schemeIdUri=["']([^"']+)["'][^>]*>/gi)]
+    .map((match) => match[1]);
+
+  const identify = (value) => {
+    const normalized = String(value || '').toLowerCase();
+    if (normalized.includes('e2719d58-a985-b3c9-781a-b030af78d30e')) return 'clearkey';
+    if (normalized.includes('edef8ba9-79d6-4ace-a3c8-27dcd51d21ed')) return 'widevine';
+    if (normalized.includes('9a04f079-9840-4286-ab92-e65be0885f95')) return 'playready';
+    return normalized || 'desconocido';
+  };
+
+  return {
+    protected: schemes.length > 0,
+    systems: [...new Set(schemes.map(identify))],
+    schemes: [...new Set(schemes)],
+  };
+}
+
 export async function validateMediaCandidate(candidate, options = {}) {
   const url = String(candidate?.url || '').trim();
   if (!url || /^(?:blob|data):/i.test(url)) {
@@ -287,6 +337,17 @@ export async function validateMediaCandidate(candidate, options = {}) {
         return { valid: false, reason: 'La respuesta no comienza con #EXTM3U.' };
       }
 
+      const drm = inspectHlsProtection(manifest);
+      if (!drm.supportedByProxy) {
+        return {
+          valid: false,
+          type: 'hls',
+          finalUrl: first.finalUrl,
+          drm,
+          reason: 'El manifiesto usa cifrado/DRM que requiere un reproductor y licencia compatibles. No se enviará a AVPlay como HLS normal.',
+        };
+      }
+
       const firstUris = hlsUris(manifest, first.finalUrl);
       if (!firstUris.length) {
         return { valid: false, reason: 'El manifiesto HLS no contiene variantes ni segmentos.' };
@@ -303,6 +364,20 @@ export async function validateMediaCandidate(candidate, options = {}) {
         const childManifest = await readTextLimited(child.response);
         if (!childManifest.trimStart().startsWith('#EXTM3U')) {
           return { valid: false, reason: 'La variante HLS es inválida.' };
+        }
+        const childDrm = inspectHlsProtection(childManifest);
+        if (!childDrm.supportedByProxy) {
+          return {
+            valid: false,
+            type: 'hls',
+            finalUrl: first.finalUrl,
+            drm: childDrm,
+            reason: 'La variante HLS usa cifrado/DRM que requiere licencia. No se enviará a AVPlay como archivo normal.',
+          };
+        }
+        if (childDrm.protected) {
+          drm.protected = true;
+          drm.entries.push(...childDrm.entries);
         }
         const childUris = hlsUris(childManifest, child.finalUrl);
         if (!childUris.length) {
@@ -328,16 +403,38 @@ export async function validateMediaCandidate(candidate, options = {}) {
         manifestUriCount: firstUris.length,
         sampleUrl: childUrl,
         status: first.response.status,
+        drm,
       };
     }
 
     if (type === 'dash') {
       const body = await readTextLimited(first.response);
+      const isMpd = /<MPD\b/i.test(body);
+      const drm = inspectDashProtection(body);
+      if (!isMpd) {
+        return {
+          valid: false,
+          type: 'dash',
+          finalUrl: first.finalUrl,
+          drm,
+          reason: 'La respuesta no contiene un manifiesto MPD.',
+        };
+      }
+      if (drm.protected) {
+        return {
+          valid: false,
+          type: 'dash',
+          finalUrl: first.finalUrl,
+          drm,
+          reason: `El manifiesto DASH usa DRM (${drm.systems.join(', ')}). La app no tiene configurado el servidor de licencia correspondiente.`,
+        };
+      }
       return {
-        valid: /<MPD\b/i.test(body),
+        valid: true,
         type: 'dash',
         finalUrl: first.finalUrl,
-        reason: /<MPD\b/i.test(body) ? '' : 'La respuesta no contiene un manifiesto MPD.',
+        drm,
+        reason: '',
       };
     }
 
