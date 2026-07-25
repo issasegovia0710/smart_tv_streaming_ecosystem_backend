@@ -2,7 +2,6 @@ import dns from 'node:dns/promises';
 import net from 'node:net';
 
 import { resolveStreamWithBrowser } from '../services/browserStreamResolver.js';
-import { decorateResolvedMedia, validateMediaCandidate } from '../services/mediaGateway.js';
 import { HttpError } from '../utils/httpError.js';
 
 const MAX_REDIRECTS = 4;
@@ -10,19 +9,6 @@ const MAX_BYTES = 256 * 1024;
 const REQUEST_TIMEOUT_MS = 4000;
 const RESOLVE_MAX_DEPTH = 1;
 const RESOLVE_MAX_REQUESTS = 3;
-
-
-const DEFAULT_TV_USER_AGENT =
-  'Mozilla/5.0 (SMART-TV; LINUX; Tizen 5.5) AppleWebKit/538.1 SamsungBrowser/2.1 TV Safari/538.1';
-
-function normalizePlaybackHeaders(input = {}) {
-  const value = input && typeof input === 'object' ? input : {};
-  return {
-    referer: String(value.referer || '').trim().slice(0, 1500),
-    origin: String(value.origin || '').trim().slice(0, 1000),
-    userAgent: String(value.userAgent || '').trim().slice(0, 500),
-  };
-}
 
 function isPrivateIpv4(address) {
   const parts = address.split('.').map(Number);
@@ -127,8 +113,7 @@ async function readLimitedBody(response, controller) {
 
 async function fetchLimited(initialUrl, options = {}) {
   let currentUrl = new URL(initialUrl);
-  const playbackHeaders = normalizePlaybackHeaders(options.playbackHeaders);
-  let currentReferer = options.referer || playbackHeaders.referer || '';
+  let currentReferer = options.referer || '';
 
   for (let redirectCount = 0; redirectCount <= MAX_REDIRECTS; redirectCount += 1) {
     await assertPublicTarget(currentUrl);
@@ -142,11 +127,11 @@ async function fetchLimited(initialUrl, options = {}) {
           options.accept ||
           'text/html,application/xhtml+xml,application/vnd.apple.mpegurl,application/x-mpegURL,application/dash+xml,video/*,*/*;q=0.5',
         Range: `bytes=0-${MAX_BYTES - 1}`,
-        'User-Agent': playbackHeaders.userAgent || DEFAULT_TV_USER_AGENT,
+        'User-Agent':
+          'Mozilla/5.0 (SMART-TV; LINUX; Tizen 5.5) AppleWebKit/538.1 SamsungBrowser/2.1 TV Safari/538.1',
       };
 
       if (currentReferer) headers.Referer = currentReferer;
-      if (playbackHeaders.origin) headers.Origin = playbackHeaders.origin;
 
       const response = await fetch(currentUrl, {
         method: 'GET',
@@ -351,12 +336,7 @@ export async function resolveWebMedia(rawUrl, options = {}) {
     throw new HttpError(400, 'La URL no tiene un formato válido.');
   }
 
-  const playbackHeaders = normalizePlaybackHeaders(options.playbackHeaders);
-  const queue = [{
-    url: startUrl.toString(),
-    depth: 0,
-    referer: playbackHeaders.referer || '',
-  }];
+  const queue = [{ url: startUrl.toString(), depth: 0, referer: '' }];
   const visited = new Set();
   let requests = 0;
   let lastReachablePage = null;
@@ -369,10 +349,7 @@ export async function resolveWebMedia(rawUrl, options = {}) {
 
     let fetched;
     try {
-      fetched = await fetchLimited(current.url, {
-        referer: current.referer,
-        playbackHeaders,
-      });
+      fetched = await fetchLimited(current.url, { referer: current.referer });
     } catch {
       continue;
     }
@@ -382,33 +359,22 @@ export async function resolveWebMedia(rawUrl, options = {}) {
     const detectedType = detectType(fetched.finalUrl, contentType, text);
 
     if (fetched.response.ok && ['hls', 'dash', 'mp4'].includes(detectedType)) {
-      const candidate = {
-        url: fetched.finalUrl,
-        type: detectedType,
-        referer: current.referer || startUrl.toString(),
-        userAgent: playbackHeaders.userAgent || '',
-        origin: playbackHeaders.origin || '',
-        cookie: '',
-      };
-      const validation = await validateMediaCandidate(candidate, { timeoutMs: 6000 });
-      if (validation.valid) {
+      const hls = detectedType === 'hls' ? inspectHls(text, fetched.finalUrl) : null;
+      if (!hls || hls.valid || fetched.finalUrl.toLowerCase().includes('.m3u8')) {
         return {
           resolved: true,
-          playbackUrl: validation.finalUrl || fetched.finalUrl,
-          resolvedType: validation.type || detectedType,
+          playbackUrl: fetched.finalUrl,
+          resolvedType: detectedType,
           sourcePageUrl: startUrl.toString(),
           resolvedFrom: current.referer || startUrl.toString(),
           requests,
-          resolverEngine: 'static-validated',
+          resolverEngine: 'static',
           cookieHeader: '',
-          userAgent: playbackHeaders.userAgent || '',
-          referer: current.referer || playbackHeaders.referer || startUrl.toString(),
-          origin: playbackHeaders.origin || '',
+          userAgent: '',
+          referer: current.referer || startUrl.toString(),
           warning: '',
           browserDiagnostics: null,
-          validation,
-          requiresProxy: detectedType === 'hls',
-          message: `Flujo ${detectedType.toUpperCase()} encontrado y validado.`,
+          message: `Flujo ${detectedType.toUpperCase()} encontrado.`,
         };
       }
     }
@@ -485,7 +451,6 @@ function diagnosticFailure(error, requestedType) {
     cookieHeader: '',
     userAgent: '',
     referer: '',
-    origin: '',
     warning: '',
     browserDiagnostics: null,
     message: error.message || 'No fue posible comprobar la fuente.',
@@ -498,15 +463,13 @@ export async function resolveStream(req, res) {
 
   const resolution = await resolveWebMedia(rawUrl, {
     forceRefresh: req.body?.forceRefresh === true,
-    playbackHeaders: normalizePlaybackHeaders(req.body?.playbackHeaders),
   });
-  return res.json({ ok: true, data: decorateResolvedMedia(req, resolution) });
+  return res.json({ ok: true, data: resolution });
 }
 
 export async function testStream(req, res) {
   const rawUrl = String(req.body?.url || '').trim();
   const requestedType = String(req.body?.streamType || '').trim().toLowerCase();
-  const playbackHeaders = normalizePlaybackHeaders(req.body?.playbackHeaders);
 
   if (!rawUrl) {
     throw new HttpError(400, 'La URL es obligatoria.');
@@ -543,11 +506,9 @@ export async function testStream(req, res) {
   }
 
   if (requestedType === 'web') {
-    const rawResolution = await resolveWebMedia(rawUrl, {
+    const resolution = await resolveWebMedia(rawUrl, {
       forceRefresh: req.body?.forceRefresh === true,
-      playbackHeaders,
     });
-    const resolution = decorateResolvedMedia(req, rawResolution);
 
     return res.json({
       ok: true,
@@ -569,13 +530,9 @@ export async function testStream(req, res) {
         cookieHeader: resolution.cookieHeader || '',
         userAgent: resolution.userAgent || '',
         referer: resolution.referer || '',
-        origin: resolution.origin || '',
         warning: resolution.warning || '',
         browserDiagnostics: resolution.browserDiagnostics || null,
         resolverRequests: resolution.requests || 0,
-        playbackMode: resolution.playbackMode || null,
-        proxyExpiresAt: resolution.proxyExpiresAt || null,
-        validation: resolution.validation || null,
         message: resolution.message,
       },
     });
@@ -583,36 +540,11 @@ export async function testStream(req, res) {
 
   let fetched;
   try {
-    fetched = await fetchLimited(parsedUrl, {
-      referer: playbackHeaders.referer,
-      playbackHeaders,
-    });
+    fetched = await fetchLimited(parsedUrl);
   } catch (error) {
-    const failure = diagnosticFailure(error, requestedType);
-    const directTypeRequested = ['hls', 'dash', 'mp4'].includes(requestedType);
-    const mayWorkFromClient =
-      directTypeRequested &&
-      /^https?:\/\//i.test(rawUrl) &&
-      ![400, 404].includes(Number(error?.statusCode || 0));
-
     return res.json({
       ok: true,
-      data: mayWorkFromClient
-        ? {
-            ...failure,
-            looksPlayable: true,
-            finalUrl: rawUrl,
-            resolvedPlaybackUrl: rawUrl,
-            resolvedType: requestedType,
-            resolverEngine: 'direct-client-fallback',
-            playbackMode: 'direct-client',
-            warning:
-              'El backend no pudo comprobar la fuente desde Vercel. ' +
-              'La vista previa local y la TV pueden intentar la URL directamente.',
-            message:
-              'Comprobación remota no disponible; se habilitó la prueba directa en el dispositivo.',
-          }
-        : failure,
+      data: diagnosticFailure(error, requestedType),
     });
   }
 
@@ -622,48 +554,14 @@ export async function testStream(req, res) {
   const text = body.toString('utf8');
   const detectedType = detectType(finalUrl, contentType, text);
   const hls = detectedType === 'hls' ? inspectHls(text, finalUrl) : null;
-  let directValidation = null;
-  let directResolution = null;
+  const looksPlayable = response.ok &&
+    detectedType !== 'html' &&
+    detectedType !== 'other' &&
+    (!hls || hls.valid);
 
-  if (response.ok && ['hls', 'dash', 'mp4'].includes(detectedType)) {
-    directValidation = await validateMediaCandidate({
-      url: finalUrl,
-      type: detectedType,
-      referer: playbackHeaders.referer,
-      origin: playbackHeaders.origin,
-      cookie: '',
-      userAgent: playbackHeaders.userAgent,
-    }, { timeoutMs: 6000 });
+  let message = 'La fuente respondió correctamente.';
 
-    if (directValidation.valid) {
-      directResolution = decorateResolvedMedia(req, {
-        resolved: true,
-        playbackUrl: directValidation.finalUrl || finalUrl,
-        resolvedType: directValidation.type || detectedType,
-        resolverEngine: 'direct-validated',
-        cookieHeader: '',
-        userAgent: playbackHeaders.userAgent,
-        referer: playbackHeaders.referer,
-        origin: playbackHeaders.origin,
-        validation: directValidation,
-        message: `Fuente ${detectedType.toUpperCase()} validada.`,
-      });
-    }
-  }
-
-  const directClientFallback =
-    !directResolution &&
-    ['hls', 'dash', 'mp4'].includes(requestedType) &&
-    [401, 403, 429].includes(Number(response.status));
-  const looksPlayable = Boolean(directResolution || directClientFallback);
-
-  let message = directResolution?.message || 'La fuente respondió correctamente.';
-
-  if (directClientFallback) {
-    message =
-      `El origen respondió HTTP ${response.status} a Vercel. ` +
-      'Se habilitó la reproducción directa desde el navegador o la TV.';
-  } else if (!response.ok) {
+  if (!response.ok) {
     message = `La fuente respondió HTTP ${response.status}.`;
   } else if (detectedType === 'html') {
     message = 'La URL devolvió una página HTML, no un stream directo.';
@@ -687,27 +585,15 @@ export async function testStream(req, res) {
       bytesInspected: body.length,
       hls,
       child: null,
-      resolvedPlaybackUrl:
-        directResolution?.playbackUrl || (directClientFallback ? rawUrl : null),
-      resolvedType:
-        directResolution?.resolvedType || (directClientFallback ? requestedType : null),
-      resolverEngine:
-        directResolution?.resolverEngine ||
-        (directClientFallback ? 'direct-client-fallback' : 'direct'),
+      resolvedPlaybackUrl: null,
+      resolvedType: null,
+      resolverEngine: 'direct',
       cookieHeader: '',
-      userAgent: playbackHeaders.userAgent,
-      referer: playbackHeaders.referer,
-      origin: playbackHeaders.origin,
-      warning: directClientFallback
-        ? 'La IP de Vercel fue rechazada por el origen. La prueba directa depende de que el dispositivo tenga acceso.'
-        : '',
+      userAgent: '',
+      referer: '',
+      warning: '',
       browserDiagnostics: null,
       resolverRequests: 0,
-      playbackMode:
-        directResolution?.playbackMode ||
-        (directClientFallback ? 'direct-client' : null),
-      proxyExpiresAt: directResolution?.proxyExpiresAt || null,
-      validation: directValidation,
       message,
     },
   });
