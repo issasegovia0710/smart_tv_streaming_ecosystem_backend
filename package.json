@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "node --watch src/server.js",
     "start": "node src/server.js",
-    "check": "node --check src/server.js && node --check src/app.js && node --check src/controllers/streamTestController.js && node --check src/services/browserStreamResolver.js",
+    "check": "node --check src/server.js && node --check src/app.js && node --check src/controllers/streamTestController.js && node --check src/controllers/tvController.js && node --check src/routes/tvRoutes.js && node --check src/services/browserStreamResolver.js && node --check src/routes/mediaRoutes.js && node --check src/services/mediaGateway.js",
     "db:setup": "node scripts/setup-tidb.js",
     "db:check": "node scripts/check-tidb.js"
   },
@@ -22,7 +22,7 @@
     "playwright-core": "1.61.1",
     "slugify": "^1.6.6"
   },
-  "packageManager": "npm@10.8.0",
+  "packageManager": "npm@10.9.2",
   "engines": {
     "node": "24.x"
   }
