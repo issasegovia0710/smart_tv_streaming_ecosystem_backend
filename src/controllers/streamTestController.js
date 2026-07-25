@@ -588,9 +588,31 @@ export async function testStream(req, res) {
       playbackHeaders,
     });
   } catch (error) {
+    const failure = diagnosticFailure(error, requestedType);
+    const directTypeRequested = ['hls', 'dash', 'mp4'].includes(requestedType);
+    const mayWorkFromClient =
+      directTypeRequested &&
+      /^https?:\/\//i.test(rawUrl) &&
+      ![400, 404].includes(Number(error?.statusCode || 0));
+
     return res.json({
       ok: true,
-      data: diagnosticFailure(error, requestedType),
+      data: mayWorkFromClient
+        ? {
+            ...failure,
+            looksPlayable: true,
+            finalUrl: rawUrl,
+            resolvedPlaybackUrl: rawUrl,
+            resolvedType: requestedType,
+            resolverEngine: 'direct-client-fallback',
+            playbackMode: 'direct-client',
+            warning:
+              'El backend no pudo comprobar la fuente desde Vercel. ' +
+              'La vista previa local y la TV pueden intentar la URL directamente.',
+            message:
+              'Comprobación remota no disponible; se habilitó la prueba directa en el dispositivo.',
+          }
+        : failure,
     });
   }
 
@@ -629,11 +651,19 @@ export async function testStream(req, res) {
     }
   }
 
-  const looksPlayable = Boolean(directResolution);
+  const directClientFallback =
+    !directResolution &&
+    ['hls', 'dash', 'mp4'].includes(requestedType) &&
+    [401, 403, 429].includes(Number(response.status));
+  const looksPlayable = Boolean(directResolution || directClientFallback);
 
   let message = directResolution?.message || 'La fuente respondió correctamente.';
 
-  if (!response.ok) {
+  if (directClientFallback) {
+    message =
+      `El origen respondió HTTP ${response.status} a Vercel. ` +
+      'Se habilitó la reproducción directa desde el navegador o la TV.';
+  } else if (!response.ok) {
     message = `La fuente respondió HTTP ${response.status}.`;
   } else if (detectedType === 'html') {
     message = 'La URL devolvió una página HTML, no un stream directo.';
@@ -657,17 +687,25 @@ export async function testStream(req, res) {
       bytesInspected: body.length,
       hls,
       child: null,
-      resolvedPlaybackUrl: directResolution?.playbackUrl || null,
-      resolvedType: directResolution?.resolvedType || null,
-      resolverEngine: directResolution?.resolverEngine || 'direct',
+      resolvedPlaybackUrl:
+        directResolution?.playbackUrl || (directClientFallback ? rawUrl : null),
+      resolvedType:
+        directResolution?.resolvedType || (directClientFallback ? requestedType : null),
+      resolverEngine:
+        directResolution?.resolverEngine ||
+        (directClientFallback ? 'direct-client-fallback' : 'direct'),
       cookieHeader: '',
       userAgent: playbackHeaders.userAgent,
       referer: playbackHeaders.referer,
       origin: playbackHeaders.origin,
-      warning: '',
+      warning: directClientFallback
+        ? 'La IP de Vercel fue rechazada por el origen. La prueba directa depende de que el dispositivo tenga acceso.'
+        : '',
       browserDiagnostics: null,
       resolverRequests: 0,
-      playbackMode: directResolution?.playbackMode || null,
+      playbackMode:
+        directResolution?.playbackMode ||
+        (directClientFallback ? 'direct-client' : null),
       proxyExpiresAt: directResolution?.proxyExpiresAt || null,
       validation: directValidation,
       message,

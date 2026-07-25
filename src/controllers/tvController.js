@@ -3,7 +3,7 @@ import { resolveWebMedia } from './streamTestController.js';
 import { HttpError } from '../utils/httpError.js';
 import { decorateResolvedMedia, validateMediaCandidate } from '../services/mediaGateway.js';
 
-const DEFAULT_APP_VERSION = '1.8.0';
+const DEFAULT_APP_VERSION = '1.8.2';
 const DEFAULT_REFRESH_INTERVAL_MS = 180000;
 
 
@@ -169,9 +169,46 @@ export async function getTvChannelPlayback(req, res) {
     );
 
     if (!validation.valid) {
+      const reason = String(validation.reason || 'validación fallida');
+      const directFallbackEnabled =
+        String(process.env.TV_DIRECT_PLAYBACK_FALLBACK || 'true').toLowerCase() !== 'false';
+      const mayBeBackendIpBlock =
+        /HTTP\s+(?:401|403|429)\b|tardó demasiado|no fue posible abrir|no fue posible conectar|fetch failed/i.test(reason);
+
+      // Algunos proveedores autorizados aceptan la IP residencial o la TV,
+      // pero rechazan las IP de centros de datos de Vercel. En ese caso no
+      // bloqueamos el canal: devolvemos la URL original para que el dispositivo
+      // la pruebe directamente, igual que las versiones anteriores de la app.
+      if (directFallbackEnabled && mayBeBackendIpBlock) {
+        res.set('Cache-Control', 'no-store, max-age=0');
+        return res.json({
+          ok: true,
+          data: {
+            resolved: true,
+            streamId: stream.id,
+            title: stream.title,
+            playbackUrl,
+            originalPlaybackUrl: playbackUrl,
+            resolvedType: requestedType,
+            resolverEngine: 'direct-device-fallback',
+            playbackMode: 'direct-device',
+            cookieHeader: '',
+            userAgent: playbackHeaders.userAgent,
+            referer: playbackHeaders.referer,
+            origin: playbackHeaders.origin,
+            validation,
+            warning:
+              `El origen rechazó la comprobación desde Vercel (${reason}). ` +
+              'La TV intentará reproducir la URL directamente.',
+            message:
+              'Reproducción directa habilitada porque el origen bloqueó al backend.',
+          },
+        });
+      }
+
       throw new HttpError(
         422,
-        `La URL configurada como ${requestedType.toUpperCase()} no devolvió un flujo reproducible: ${validation.reason || 'validación fallida'}`,
+        `La URL configurada como ${requestedType.toUpperCase()} no devolvió un flujo reproducible: ${reason}`,
       );
     }
 
