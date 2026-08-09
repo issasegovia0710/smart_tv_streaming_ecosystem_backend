@@ -369,7 +369,8 @@ export async function resolveStreamWithBrowser(rawUrl, options = {}) {
   const configuredUserAgent = String(configuredHeaders.userAgent || DEFAULT_USER_AGENT).slice(0, 500);
   const configuredReferer = String(configuredHeaders.referer || '').slice(0, 1500);
   const configuredOrigin = String(configuredHeaders.origin || '').slice(0, 1000);
-  const cacheKey = `${rawUrl}::${configuredReferer}::${configuredOrigin}::${configuredUserAgent}`;
+  const preferredType = String(options.preferredType || '').toLowerCase();
+  const cacheKey = `${rawUrl}::${configuredReferer}::${configuredOrigin}::${configuredUserAgent}::${preferredType}`;
   const cached = options.forceRefresh ? null : cacheGet(cacheKey);
   if (cached) return cached;
 
@@ -749,10 +750,15 @@ export async function resolveStreamWithBrowser(rawUrl, options = {}) {
     const compatibleResults = validationResults
       .filter((entry) => entry.validation.valid)
       .sort((a, b) => {
+        // Cuando el cliente Roku pide HLS, el tipo tiene prioridad incluso si
+        // un DASH obtuvo una confianza de inspección ligeramente mayor.
+        if (preferredType === 'hls' && a.candidate.type !== b.candidate.type) {
+          if (a.candidate.type === 'hls') return -1;
+          if (b.candidate.type === 'hls') return 1;
+        }
         const aConfidence = confidenceRank[a.validation.rokuConfidence] || 0;
         const bConfidence = confidenceRank[b.validation.rokuConfidence] || 0;
         if (aConfidence !== bConfidence) return bConfidence - aConfidence;
-        // Para Roku preferimos HLS validado sobre DASH cuando ambos están disponibles.
         if (a.candidate.type !== b.candidate.type) {
           if (a.candidate.type === 'hls') return -1;
           if (b.candidate.type === 'hls') return 1;

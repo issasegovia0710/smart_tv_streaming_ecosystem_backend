@@ -152,8 +152,10 @@ export async function getTvChannelPlayback(req, res) {
     );
   }
 
+  const preferredType = String(req.query.prefer || '').toLowerCase() === 'hls' ? 'hls' : '';
   const resolution = await resolveWebMedia(stream.sourceUrl, {
     forceRefresh: req.query.refresh === '1' || req.query.refresh === 'true',
+    preferredType,
   });
 
   // Los canales WEB que terminan en HLS deben pasar por el gateway del

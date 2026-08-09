@@ -2,6 +2,7 @@ import dns from 'node:dns/promises';
 import net from 'node:net';
 
 import { resolveStreamWithBrowser } from '../services/browserStreamResolver.js';
+import { validateMediaCandidate } from '../services/mediaGateway.js';
 import { HttpError } from '../utils/httpError.js';
 
 const MAX_REDIRECTS = 4;
@@ -329,19 +330,33 @@ function extractCandidates(html, baseUrl) {
 }
 
 export async function resolveWebMedia(rawUrl, options = {}) {
-  let startUrl;
+  let originalStartUrl;
   try {
-    startUrl = new URL(rawUrl);
+    originalStartUrl = new URL(rawUrl);
   } catch {
     throw new HttpError(400, 'La URL no tiene un formato válido.');
   }
 
-  const queue = [{ url: startUrl.toString(), depth: 0, referer: '' }];
+  const preferredType = String(options.preferredType || '').toLowerCase();
+  const initialPages = [];
+
+  // Algunas páginas permiten solicitar explícitamente HLS o DASH mediante
+  // manifest_type. Para Roku preferimos HLS, pero nunca destruimos la URL
+  // original: si la variante HLS no existe, se intenta la página original.
+  if (preferredType === 'hls' && originalStartUrl.searchParams.has('manifest_type')) {
+    const preferred = new URL(originalStartUrl);
+    preferred.searchParams.set('manifest_type', 'hls');
+    initialPages.push(preferred.toString());
+  }
+  initialPages.push(originalStartUrl.toString());
+
+  const queue = [...new Set(initialPages)].map((url) => ({ url, depth: 0, referer: '' }));
   const visited = new Set();
   let requests = 0;
   let lastReachablePage = null;
+  const staticValid = [];
 
-  while (queue.length && requests < RESOLVE_MAX_REQUESTS) {
+  while (queue.length && requests < Math.max(RESOLVE_MAX_REQUESTS, initialPages.length + 2)) {
     const current = queue.shift();
     if (!current || visited.has(current.url)) continue;
     visited.add(current.url);
@@ -359,24 +374,43 @@ export async function resolveWebMedia(rawUrl, options = {}) {
     const detectedType = detectType(fetched.finalUrl, contentType, text);
 
     if (fetched.response.ok && ['hls', 'dash', 'mp4'].includes(detectedType)) {
-      const hls = detectedType === 'hls' ? inspectHls(text, fetched.finalUrl) : null;
-      if (!hls || hls.valid || fetched.finalUrl.toLowerCase().includes('.m3u8')) {
-        return {
+      // IMPORTANTE: antes esta rama devolvía la primera URL encontrada sin
+      // pasar por validateMediaCandidate(). Eso hacía que un MPD/playlist que
+      // respondía HTTP 200 pero era incompatible llegara directo al Roku.
+      const validation = await validateMediaCandidate({
+        url: fetched.finalUrl,
+        type: detectedType,
+        referer: current.referer || originalStartUrl.toString(),
+        userAgent: '',
+        origin: '',
+        cookie: '',
+      }, { timeoutMs: 6000 });
+
+      if (validation.valid) {
+        const result = {
           resolved: true,
-          playbackUrl: fetched.finalUrl,
+          playbackUrl: validation.finalUrl || fetched.finalUrl,
           resolvedType: detectedType,
-          sourcePageUrl: startUrl.toString(),
-          resolvedFrom: current.referer || startUrl.toString(),
+          sourcePageUrl: originalStartUrl.toString(),
+          resolvedFrom: current.referer || originalStartUrl.toString(),
           requests,
-          resolverEngine: 'static',
+          resolverEngine: 'static-validated',
           cookieHeader: '',
           userAgent: '',
-          referer: current.referer || startUrl.toString(),
+          referer: current.referer || originalStartUrl.toString(),
           warning: '',
           browserDiagnostics: null,
-          message: `Flujo ${detectedType.toUpperCase()} encontrado.`,
+          validation,
+          requiresProxy: detectedType === 'hls',
+          message: `Flujo ${detectedType.toUpperCase()} encontrado y validado.`,
         };
+
+        // Si Roku pidió HLS y ya lo encontramos, no tiene sentido seguir.
+        if (preferredType === 'hls' && detectedType === 'hls') return result;
+        staticValid.push(result);
       }
+      // Si la URL multimedia no superó la validación, seguimos buscando.
+      continue;
     }
 
     if (!fetched.response.ok || detectedType !== 'html') continue;
@@ -387,9 +421,17 @@ export async function resolveWebMedia(rawUrl, options = {}) {
     const candidates = extractCandidates(text, fetched.finalUrl);
     const nextDepth = current.depth + 1;
 
-    for (let index = candidates.media.length - 1; index >= 0; index -= 1) {
+    // HLS primero si Roku lo pidió. El resto conserva su orden normal.
+    const mediaCandidates = candidates.media.slice().sort((a, b) => {
+      if (preferredType !== 'hls') return 0;
+      const ah = /\.m3u8(?:$|[?#])/i.test(a) ? 1 : 0;
+      const bh = /\.m3u8(?:$|[?#])/i.test(b) ? 1 : 0;
+      return bh - ah;
+    });
+
+    for (let index = mediaCandidates.length - 1; index >= 0; index -= 1) {
       queue.unshift({
-        url: candidates.media[index],
+        url: mediaCandidates[index],
         depth: nextDepth,
         referer: fetched.finalUrl,
       });
@@ -406,29 +448,76 @@ export async function resolveWebMedia(rawUrl, options = {}) {
     }
   }
 
-  const browserResolution = await resolveStreamWithBrowser(startUrl.toString(), options);
-
-  if (browserResolution.resolved) {
-    return {
-      ...browserResolution,
-      sourcePageUrl: startUrl.toString(),
-      resolvedFrom: browserResolution.referer || lastReachablePage || startUrl.toString(),
-      requests,
-      staticRequests: requests,
-      browserAttempted: true,
-    };
+  if (staticValid.length) {
+    staticValid.sort((a, b) => {
+      if (preferredType === 'hls') {
+        if (a.resolvedType === 'hls' && b.resolvedType !== 'hls') return -1;
+        if (b.resolvedType === 'hls' && a.resolvedType !== 'hls') return 1;
+      }
+      return 0;
+    });
+    return staticValid[0];
   }
+
+  // Si la página original pide MPD, damos primero al navegador la variante HLS
+  // para Roku. Si no resuelve nada, se reintenta con la URL original.
+  const browserUrls = [];
+  if (preferredType === 'hls' && originalStartUrl.searchParams.has('manifest_type')) {
+    const preferred = new URL(originalStartUrl);
+    preferred.searchParams.set('manifest_type', 'hls');
+    browserUrls.push(preferred.toString());
+  }
+  browserUrls.push(originalStartUrl.toString());
+
+  let lastBrowserResolution = null;
+  for (const browserUrl of [...new Set(browserUrls)]) {
+    const browserResolution = await resolveStreamWithBrowser(browserUrl, {
+      ...options,
+      preferredType,
+    });
+    lastBrowserResolution = browserResolution;
+
+    if (browserResolution.resolved) {
+      if (preferredType !== 'hls' || browserResolution.resolvedType === 'hls') {
+        return {
+          ...browserResolution,
+          sourcePageUrl: originalStartUrl.toString(),
+          resolvedFrom: browserResolution.referer || lastReachablePage || originalStartUrl.toString(),
+          requests,
+          staticRequests: requests,
+          browserAttempted: true,
+        };
+      }
+      staticValid.push({
+        ...browserResolution,
+        sourcePageUrl: originalStartUrl.toString(),
+        resolvedFrom: browserResolution.referer || lastReachablePage || originalStartUrl.toString(),
+        requests,
+        staticRequests: requests,
+        browserAttempted: true,
+      });
+    }
+  }
+
+  if (staticValid.length) return staticValid[0];
+
+  const browserResolution = lastBrowserResolution || {
+    resolved: false,
+    playbackUrl: null,
+    resolvedType: null,
+    message: 'No se encontró una fuente multimedia compatible.',
+  };
 
   return {
     ...browserResolution,
-    sourcePageUrl: startUrl.toString(),
+    sourcePageUrl: originalStartUrl.toString(),
     resolvedFrom: lastReachablePage,
     requests,
     staticRequests: requests,
     browserAttempted: true,
     message:
       browserResolution.message ||
-      'La página respondió, pero no se encontró una URL directa HLS, DASH o MP4. La app no abrirá el navegador.',
+      'La página respondió, pero no se encontró una URL directa HLS, DASH o MP4 compatible. La app no abrirá el navegador.',
   };
 }
 
