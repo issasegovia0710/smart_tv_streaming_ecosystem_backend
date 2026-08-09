@@ -48,6 +48,59 @@ function normalizeChromiumPackUrl(value) {
 
 const resolutionCache = new Map();
 
+// Vercel Fluid Compute puede ejecutar varias solicitudes dentro del mismo
+// proceso. @sparticuz/chromium-min extrae Chromium a /tmp/chromium; si dos
+// solicitudes hacen esa extracción al mismo tiempo, Linux puede responder
+// ETXTBSY al intentar ejecutar el binario mientras todavía está siendo escrito.
+// Esta promesa compartida garantiza una sola extracción por proceso/pack.
+const chromiumExecutablePromises = new Map();
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isTextFileBusyError(error) {
+  const message = String(error?.message || error || '');
+  return error?.code === 'ETXTBSY' || /ETXTBSY|text file busy/i.test(message);
+}
+
+async function getServerlessChromiumExecutable(serverlessChromium, packUrl) {
+  let pending = chromiumExecutablePromises.get(packUrl);
+  if (!pending) {
+    pending = serverlessChromium.executablePath(packUrl);
+    chromiumExecutablePromises.set(packUrl, pending);
+  }
+
+  try {
+    return await pending;
+  } catch (error) {
+    // Si la descarga/extracción falló, permitimos que una petición posterior
+    // vuelva a intentarlo en lugar de conservar una promesa rechazada.
+    if (chromiumExecutablePromises.get(packUrl) === pending) {
+      chromiumExecutablePromises.delete(packUrl);
+    }
+    throw error;
+  }
+}
+
+async function launchChromiumWithBusyRetry(playwrightChromium, options) {
+  const delays = [0, 250, 700, 1400];
+  let lastError;
+
+  for (let attempt = 0; attempt < delays.length; attempt += 1) {
+    if (delays[attempt]) await wait(delays[attempt]);
+
+    try {
+      return await playwrightChromium.launch(options);
+    } catch (error) {
+      lastError = error;
+      if (!isTextFileBusyError(error) || attempt === delays.length - 1) throw error;
+    }
+  }
+
+  throw lastError;
+}
+
 function isPrivateIpv4(address) {
   const parts = address.split('.').map(Number);
   if (parts.length !== 4 || parts.some((part) => Number.isNaN(part))) return true;
@@ -236,7 +289,10 @@ async function launchBrowser() {
     const fallbackPackUrl = defaultChromiumPackUrl();
 
     try {
-      executablePath = await serverlessChromium.executablePath(configuredPackUrl);
+      executablePath = await getServerlessChromiumExecutable(
+        serverlessChromium,
+        configuredPackUrl,
+      );
     } catch (firstError) {
       if (configuredPackUrl === fallbackPackUrl) {
         throw new Error(
@@ -245,7 +301,10 @@ async function launchBrowser() {
       }
 
       try {
-        executablePath = await serverlessChromium.executablePath(fallbackPackUrl);
+        executablePath = await getServerlessChromiumExecutable(
+          serverlessChromium,
+          fallbackPackUrl,
+        );
       } catch (fallbackError) {
         throw new Error(
           `No se pudo descargar Chromium. URL configurada: ${configuredPackUrl}. ` +
@@ -257,7 +316,7 @@ async function launchBrowser() {
     args = [...serverlessChromium.args, '--autoplay-policy=no-user-gesture-required'];
   }
 
-  const browser = await playwrightChromium.launch({
+  const browser = await launchChromiumWithBusyRetry(playwrightChromium, {
     args,
     executablePath,
     headless: true,
