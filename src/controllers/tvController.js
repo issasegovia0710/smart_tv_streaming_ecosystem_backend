@@ -1,6 +1,7 @@
 import { pool } from '../config/db.js';
 import { resolveWebMedia } from './streamTestController.js';
 import { HttpError } from '../utils/httpError.js';
+import { decorateResolvedMedia } from '../services/mediaGateway.js';
 
 const DEFAULT_APP_VERSION = '1.6.0';
 const DEFAULT_REFRESH_INTERVAL_MS = 180000;
@@ -155,11 +156,17 @@ export async function getTvChannelPlayback(req, res) {
     forceRefresh: req.query.refresh === '1' || req.query.refresh === 'true',
   });
 
+  // Los canales WEB que terminan en HLS deben pasar por el gateway del
+  // backend. El gateway conserva User-Agent/Referer/Origin/Cookie y reescribe
+  // el master playlist, las variantes, llaves AES-128 y segmentos para que el
+  // Roku solo tenga que hablar con nuestro dominio.
+  const playback = decorateResolvedMedia(req, resolution);
+
   res.set('Cache-Control', 'no-store, max-age=0');
   return res.json({
     ok: true,
     data: {
-      ...resolution,
+      ...playback,
       streamId: stream.id,
       title: stream.title,
     },
