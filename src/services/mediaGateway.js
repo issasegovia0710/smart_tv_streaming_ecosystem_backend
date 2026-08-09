@@ -249,15 +249,80 @@ function hlsUris(text, baseUrl) {
   return [...new Set(output)];
 }
 
-async function readFirstChunk(response) {
-  if (!response.body) return 0;
+async function readFirstBytes(response, maxBytes = 4096) {
+  if (!response.body) return Buffer.alloc(0);
   const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
   try {
-    const { value } = await reader.read();
-    return value?.byteLength || 0;
+    while (total < maxBytes) {
+      const { value, done } = await reader.read();
+      if (done || !value) break;
+      const chunk = Buffer.from(value);
+      const remaining = maxBytes - total;
+      chunks.push(chunk.subarray(0, remaining));
+      total += Math.min(chunk.length, remaining);
+      if (chunk.length >= remaining) break;
+    }
+    return Buffer.concat(chunks);
   } finally {
     try { await reader.cancel(); } catch {}
   }
+}
+
+async function readFirstChunk(response) {
+  return (await readFirstBytes(response, 2048)).length;
+}
+
+function classifyMediaBytes(buffer) {
+  if (!buffer || buffer.length === 0) return { playable: false, container: 'empty', reason: 'El segmento está vacío.' };
+
+  const prefix = buffer.subarray(0, Math.min(buffer.length, 512));
+  const ascii = prefix.toString('utf8').trimStart();
+  const lower = ascii.toLowerCase();
+
+  if (lower.startsWith('<!doctype') || lower.startsWith('<html') || lower.startsWith('<head') || lower.startsWith('<body')) {
+    return { playable: false, container: 'html', reason: 'La supuesta respuesta multimedia es HTML.' };
+  }
+  if (ascii.startsWith('#EXTM3U')) {
+    return { playable: false, container: 'hls-manifest', reason: 'Se recibió otro manifiesto donde se esperaba un segmento.' };
+  }
+  if (/^<\?xml/i.test(ascii) || /<MPD\b/i.test(ascii)) {
+    return { playable: false, container: 'dash-manifest', reason: 'Se recibió un MPD donde se esperaba un segmento.' };
+  }
+  if ((ascii.startsWith('{') || ascii.startsWith('[')) && /(?:error|message|status|html)/i.test(ascii.slice(0, 250))) {
+    return { playable: false, container: 'json', reason: 'La supuesta respuesta multimedia parece ser JSON de error.' };
+  }
+
+  // MPEG-TS: byte de sincronía 0x47 cada 188 bytes.
+  if (buffer[0] === 0x47 && (buffer.length < 189 || buffer[188] === 0x47 || (buffer.length > 376 && buffer[376] === 0x47))) {
+    return { playable: true, container: 'mpeg-ts', confidence: 'high' };
+  }
+
+  // ISO-BMFF / fMP4, típico de HLS CMAF y DASH.
+  if (buffer.length >= 8) {
+    const box = buffer.subarray(4, 8).toString('ascii');
+    if (['ftyp', 'styp', 'moof', 'sidx'].includes(box)) {
+      return { playable: true, container: 'fmp4', confidence: 'high' };
+    }
+  }
+
+  // ADTS AAC es válido para streams de solo audio, aunque no es lo habitual en TV.
+  if (buffer.length >= 2 && buffer[0] === 0xff && (buffer[1] & 0xf6) === 0xf0) {
+    return { playable: true, container: 'aac-adts', confidence: 'medium' };
+  }
+
+  // Un segmento que empieza con ID3 sin un contenedor reconocible detrás suele
+  // producir errores del parser de Roku (reader/pick stream/ID3...).
+  if (buffer.length >= 3 && buffer.subarray(0, 3).toString('ascii') === 'ID3') {
+    return {
+      playable: false,
+      container: 'id3-only',
+      reason: 'El segmento comienza con ID3 y no expone un contenedor de video Roku reconocible.',
+    };
+  }
+
+  return { playable: true, container: 'unknown', confidence: 'low' };
 }
 
 
@@ -353,6 +418,7 @@ export async function validateMediaCandidate(candidate, options = {}) {
         return { valid: false, reason: 'El manifiesto HLS no contiene variantes ni segmentos.' };
       }
 
+      let selectedSample = null;
       let childUrl = firstUris[0];
       let child = await fetchPublic(childUrl, upstreamHeaders(headersData, { Referer: headersData.referer || first.finalUrl }), { timeoutMs });
       if (!child.response.ok) {
@@ -386,14 +452,39 @@ export async function validateMediaCandidate(candidate, options = {}) {
         childUrl = childUris.find((item) => !/\.m3u8(?:$|[?#])/i.test(item)) || childUris[0];
         child = await fetchPublic(
           childUrl,
-          upstreamHeaders(headersData, { Range: 'bytes=0-2047', Referer: headersData.referer || first.finalUrl }),
+          upstreamHeaders(headersData, { Range: 'bytes=0-4095', Referer: headersData.referer || first.finalUrl }),
           { timeoutMs },
         );
-        if (!child.response.ok || (await readFirstChunk(child.response)) === 0) {
-          return { valid: false, reason: `El primer segmento no respondió correctamente (HTTP ${child.response.status}).` };
+        if (!child.response.ok) {
+          return { valid: false, reason: `El primer segmento respondió HTTP ${child.response.status}.` };
         }
-      } else if ((await readFirstChunk(child.response)) === 0) {
-        return { valid: false, reason: 'El primer segmento está vacío.' };
+        const sampleBytes = await readFirstBytes(child.response, 4096);
+        const sample = classifyMediaBytes(sampleBytes);
+        if (!sample.playable) {
+          return {
+            valid: false,
+            type: 'hls',
+            finalUrl: first.finalUrl,
+            sampleUrl: childUrl,
+            sampleContainer: sample.container,
+            reason: `El primer segmento no es compatible con Roku: ${sample.reason}`,
+          };
+        }
+        selectedSample = sample;
+      } else {
+        const sampleBytes = await readFirstBytes(child.response, 4096);
+        const sample = classifyMediaBytes(sampleBytes);
+        if (!sample.playable) {
+          return {
+            valid: false,
+            type: 'hls',
+            finalUrl: first.finalUrl,
+            sampleUrl: childUrl,
+            sampleContainer: sample.container,
+            reason: `El primer segmento no es compatible con Roku: ${sample.reason}`,
+          };
+        }
+        selectedSample = sample;
       }
 
       return {
@@ -402,6 +493,8 @@ export async function validateMediaCandidate(candidate, options = {}) {
         finalUrl: first.finalUrl,
         manifestUriCount: firstUris.length,
         sampleUrl: childUrl,
+        sampleContainer: selectedSample?.container || 'unknown',
+        rokuConfidence: selectedSample?.confidence || 'low',
         status: first.response.status,
         drm,
       };

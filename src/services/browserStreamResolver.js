@@ -745,7 +745,21 @@ export async function resolveStreamWithBrowser(rawUrl, options = {}) {
         };
       }),
     );
-    const validated = validationResults.find((entry) => entry.validation.valid);
+    const confidenceRank = { high: 3, medium: 2, low: 1 };
+    const compatibleResults = validationResults
+      .filter((entry) => entry.validation.valid)
+      .sort((a, b) => {
+        const aConfidence = confidenceRank[a.validation.rokuConfidence] || 0;
+        const bConfidence = confidenceRank[b.validation.rokuConfidence] || 0;
+        if (aConfidence !== bConfidence) return bConfidence - aConfidence;
+        // Para Roku preferimos HLS validado sobre DASH cuando ambos están disponibles.
+        if (a.candidate.type !== b.candidate.type) {
+          if (a.candidate.type === 'hls') return -1;
+          if (b.candidate.type === 'hls') return 1;
+        }
+        return b.candidate.score - a.candidate.score;
+      });
+    const validated = compatibleResults[0] || null;
     const selected = validated?.candidate || null;
     const selectedValidation = validated?.validation || null;
 
